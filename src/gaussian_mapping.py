@@ -23,6 +23,7 @@ from .gaussian_splatting.gaussian_renderer import render
 from .gaussian_splatting.scene.gaussian_model import GaussianModel
 from .gaussian_splatting.camera_utils import Camera
 from .losses import mapping_rgbd_loss, plot_losses
+from .resource_management import ResourceAdmission
 
 from .gaussian_splatting.pose_utils import update_pose
 from .gaussian_splatting.utils.graphics_utils import getProjectionMatrix2, focal2fov
@@ -96,7 +97,21 @@ class GaussianMapper(object):
                 "Warning. You are feeding back poses from Mapper to Tracker without optimizing them (either during Tracking or Refinement)!"
             )
 
-        self.gaussians = GaussianModel(self.sh_degree, config=cfg.mapping.input)
+        resource_admission_cfg = cfg.mapping.get("resource_admission", None)
+        resource_admission_mode = "disabled"
+
+        if resource_admission_cfg is not None:
+            resource_admission_mode = str(resource_admission_cfg.get("mode", "disabled")).strip().lower()
+
+        self.resource_admission = None
+        if resource_admission_mode != "disabled":
+            self.resource_admission = ResourceAdmission(mode=resource_admission_mode)
+
+        self.gaussians = GaussianModel(
+            self.sh_degree,
+            config=cfg.mapping.input,
+            resource_admission=self.resource_admission,
+        )
         self.gaussians.init_lr(self.opt_params.init_lr)
         self.gaussians.training_setup(self.opt_params)
 

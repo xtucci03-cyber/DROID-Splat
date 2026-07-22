@@ -161,7 +161,7 @@ def unscale_gradients(variable: torch.nn.Parameter, inverse_fn) -> torch.Tensor:
 
 
 class GaussianModel:
-    def __init__(self, sh_degree: int, config=None, device: str = "cuda:0"):
+    def __init__(self, sh_degree: int, config=None, device: str = "cuda:0", resource_admission=None):
         self.active_sh_degree = 0
         self.max_sh_degree = sh_degree
         self.device = device
@@ -195,6 +195,7 @@ class GaussianModel:
         self.rotation_activation = torch.nn.functional.normalize
 
         self.cfg = config
+        self.resource_admission = resource_admission
         self.ply_input = None
 
         self.isotropic = False
@@ -517,7 +518,35 @@ class GaussianModel:
         )
         if features is not None:
             fused_point_cloud, features, scales, rots, opacities = features
-            self.extend_from_pcd(fused_point_cloud, features, scales, rots, opacities, kf_id)
+
+            if self.resource_admission is None:
+                self.extend_from_pcd(fused_point_cloud, features, scales, rots, opacities, kf_id)
+            else:
+                result = self.resource_admission.observe_before_extend(
+                    xyz=fused_point_cloud,
+                    features=features,
+                    scales=scales,
+                    rotations=rots,
+                    opacities=opacities,
+                    camera_uid=cam_info.uid,
+                    kf_id=kf_id,
+                    init=init,
+                    gaussian_before=len(self),
+                )
+
+                self.extend_from_pcd(
+                    result.xyz,
+                    result.features,
+                    result.scales,
+                    result.rotations,
+                    result.opacities,
+                    kf_id,
+                )
+
+                self.resource_admission.observe_after_extend(
+                    result,
+                    gaussian_after_extend=len(self),
+                )
         else:
             print("No points in the point cloud")
 
