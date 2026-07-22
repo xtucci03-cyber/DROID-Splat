@@ -97,6 +97,7 @@ class GaussianMapper(object):
                 "Warning. You are feeding back poses from Mapper to Tracker without optimizing them (either during Tracking or Refinement)!"
             )
 
+        # OURS-M01: ResourceAdmission configuration and module injection.
         resource_admission_cfg = cfg.mapping.get("resource_admission", None)
         resource_admission_mode = "disabled"
 

@@ -161,7 +161,7 @@ class ResourceAdmission:
         event["admission_cpu_ms"] = round(result.admission_cpu_ms, 6)
 
         print(
-            "[ResourceAdmission] "
+            "[M01:ResourceAdmission] "
             + json.dumps(
                 event,
                 ensure_ascii=False,

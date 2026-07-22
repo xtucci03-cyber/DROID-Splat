@@ -519,6 +519,7 @@ class GaussianModel:
         if features is not None:
             fused_point_cloud, features, scales, rots, opacities = features
 
+            # OURS-M01: Candidate observation hook before persistent Gaussian insertion.
             if self.resource_admission is None:
                 self.extend_from_pcd(fused_point_cloud, features, scales, rots, opacities, kf_id)
             else:
