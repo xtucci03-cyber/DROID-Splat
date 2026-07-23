@@ -1,0 +1,13 @@
+统计口径：nvidia-smi每秒采样
+在线SLAM结束时间：2026-07-23 16:03:47 +08:00
+阶段边界依据：日志中的 Total time elapsed 与 Gaussian Mapping Done
+online_slam_samples=171
+online_slam_mean_vram_mib=5182.87
+online_slam_peak_vram_mib=8903
+evaluation_samples=123
+evaluation_mean_vram_mib=2365.27
+evaluation_peak_vram_mib=2527
+end_to_end_samples=294
+end_to_end_mean_vram_mib=4004.08
+end_to_end_peak_vram_mib=8903
+说明：阶段边界按秒划分，边界附近最多存在一个采样点误差。

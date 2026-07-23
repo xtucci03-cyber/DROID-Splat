@@ -1,0 +1,95 @@
+{
+  "experiment_id": "002_m01_observe_fr1desk_full_eval_r1",
+  "experiment_role": "m01_observe_full_sequence",
+  "code": {
+    "commit": "989a3f6da58057d212afe9ed047d730d496d989b",
+    "expected_commit": "989a3f6da58057d212afe9ed047d730d496d989b",
+    "worktree_clean": true,
+    "m01_mode": "observe"
+  },
+  "map": {
+    "final_gaussians_from_ply": 67420,
+    "final_ply": "/home/XT/gsslam/1_droidsplat/records/002_m01_observe_fr1desk_full_eval_r1/mesh/final_rgbd.ply"
+  },
+  "timing": {
+    "wall_seconds_including_evaluation": 298,
+    "online_slam_minutes_reported": 2.49,
+    "online_total_fps_reported": 3.96
+  },
+  "trajectory": {
+    "all_frame_ate_rmse_m": 0.015211889395437998,
+    "keyframe_ate_rmse_m": 0.017721160974774275
+  },
+  "rendering": {
+    "keyframes": {
+      "psnr": 23.770012012426402,
+      "ssim": 0.9995755976524906,
+      "lpips": 0.19757238300382227,
+      "depth_l1": 0.03855827502042487
+    },
+    "non_keyframes": {
+      "psnr": 22.847126279558456,
+      "ssim": 0.9995054523150126,
+      "lpips": 0.21651173475242796,
+      "depth_l1": 0.03588257229753903
+    }
+  },
+  "m01": {
+    "events": 69,
+    "init_events": 1,
+    "ordinary_events": 68,
+    "candidate_total": 64651,
+    "admitted_total": 64651,
+    "dropped_total": 0,
+    "all_passthrough": true,
+    "ordinary_min": 594,
+    "ordinary_median": 875.5,
+    "ordinary_mean": 847,
+    "ordinary_max": 1025,
+    "m01_cpu_mean_ms": 0.23263956521739132,
+    "m01_cpu_max_ms": 0.513969,
+    "last_gaussian_after_extend": 65207
+  },
+  "resources_nvidia_smi": {
+    "online_slam_samples": 170,
+    "online_slam_mean_vram_mib": 5122.358823529412,
+    "online_slam_peak_vram_mib": 9540.0,
+    "evaluation_samples": 124,
+    "evaluation_mean_vram_mib": 2378.201612903226,
+    "evaluation_peak_vram_mib": 2529.0,
+    "end_to_end_samples": 294,
+    "end_to_end_mean_vram_mib": 3964.9591836734694,
+    "end_to_end_peak_vram_mib": 9540.0
+  },
+  "comparison_to_001": {
+    "final_gaussians_delta": -134,
+    "all_frame_ate_delta_m": -8.413918845141116e-07,
+    "keyframe_psnr_delta_db": 0.09774174897566823,
+    "online_mean_vram_delta_mib": -60.511176470588,
+    "online_peak_vram_delta_mib": 637.0
+  },
+  "validation": {
+    "status": "PASS",
+    "checks": {
+      "observe_commit": true,
+      "worktree_clean": true,
+      "full_sequence_no_t_stop": true,
+      "evaluate_enabled": true,
+      "render_images_enabled": true,
+      "save_predictions_enabled": true,
+      "exit_code_zero": true,
+      "traceback_zero": true,
+      "cuda_error_zero": true,
+      "m01_events_exist": true,
+      "observe_all_passthrough": true,
+      "final_ply_exists": true,
+      "official_evaluation_exists": {
+        "mean_psnr": 22.847126279558456,
+        "mean_ssim": 0.9995054523150126,
+        "mean_lpips": 0.21651173475242796,
+        "mean_l1": 0.03588257229753903
+      },
+      "gpu_monitor_exists": true
+    }
+  }
+}

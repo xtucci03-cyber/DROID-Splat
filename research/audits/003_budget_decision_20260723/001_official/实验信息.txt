@@ -1,0 +1,11 @@
+实验名称=001_official_baseline_fr1desk_full_eval_r1
+实验性质=纯官方完整序列正式Baseline
+数据集=TUM RGB-D fr1_desk完整序列
+帧限制=无t_stop
+commit=f0cb0316e1ee7f88f8a63c37a6fe19dd623e6eb2
+worktree=clean
+evaluate=True
+render_images=True
+save_rendered_predictions=True
+目标指标=ATE,PSNR,SSIM,LPIPS,Gaussian,VRAM,Time,FPS
+创建时间=2026-07-23T15:58:22+08:00

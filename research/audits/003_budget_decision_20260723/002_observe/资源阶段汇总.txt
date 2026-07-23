@@ -1,0 +1,11 @@
+统计口径：nvidia-smi每秒采样
+online_slam_samples=170
+online_slam_mean_vram_mib=5122.36
+online_slam_peak_vram_mib=9540
+evaluation_samples=124
+evaluation_mean_vram_mib=2378.20
+evaluation_peak_vram_mib=2529
+end_to_end_samples=294
+end_to_end_mean_vram_mib=3964.96
+end_to_end_peak_vram_mib=9540
+说明：阶段边界按日志时间精确到秒划分。

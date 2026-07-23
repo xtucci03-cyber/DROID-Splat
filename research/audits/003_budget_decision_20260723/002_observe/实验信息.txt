@@ -1,0 +1,12 @@
+实验名称=002_m01_observe_fr1desk_full_eval_r1
+实验性质=M01 Observe完整序列严格配对实验
+对照实验=001_official_baseline_fr1desk_full_eval_r1
+数据集=TUM RGB-D fr1_desk完整序列
+commit=989a3f6da58057d212afe9ed047d730d496d989b
+M01模式=observe
+候选行为=全部透传，不筛选，不删除
+evaluate=True
+render_images=True
+save_rendered_predictions=True
+唯一方法差异=M01 Observe
+创建时间=2026-07-23T16:34:39+08:00

@@ -1,0 +1,197 @@
+device: cuda:0
+sync_method: strict
+output_folder: ./outputs/
+stride: 1
+mode: rgbd
+mono_depth: metric3d-vit_giant2
+with_dyn: false
+opt_intr: false
+sleep_delay: 0.45
+run_frontend: true
+run_backend: true
+run_loop_detection: false
+run_mapping: true
+run_visualization: false
+run_mapping_gui: false
+show_stream: false
+render_images: true
+save_rendered_predictions: true
+backend_every: 8
+mapper_every: 20
+evaluate: true
+mapping:
+  warmup: 10
+  delay: 5
+  online_opt:
+    iters: 100
+    n_last_frames: 10
+    n_rand_frames: 20
+    batch_mode: false
+    batch_size: 10
+    optimize_poses: false
+    prune_every: 2
+    pruning:
+      use_covisibility: true
+      covisibility:
+        mode: new
+        last: 10
+        dont_prune_latest: 0
+        visibility_th: 2
+    prune_densify_every: 25
+    prune_densify_until: 55
+    densify:
+      accumulate_pixels: false
+      vanilla:
+        max_grad: 0.001
+        extent: 5
+        min_opacity: 0.05
+        max_screen_size: 15
+        scale_std: 1.0
+    filter:
+      multiview: true
+      mv_count_th: 2
+      bin_th: 0.1
+      uncertainty: false
+      conf_th: 0.1
+      min_disp_th: 0.001
+      hard_disp_th: 0.001
+  opt_params:
+    init_lr: 6.0
+    position_lr_init: 0.001
+    position_lr_final: 0.0005
+    position_lr_delay_mult: 0.01
+    position_lr_max_steps: 100
+    feature_lr: 0.001
+    opacity_lr: 0.02
+    scaling_lr: 0.001
+    rotation_lr: 0.0004
+    percent_dense: 0.01
+    cam_rot_delta: 1.0e-05
+    cam_trans_delta: 1.0e-05
+  loss:
+    supervise_with_prior: true
+    with_ssim: true
+    with_edge_weight: false
+    with_depth_smoothness: false
+    use_ms_ssim: false
+    depth_func: l1
+    rgb_boundary_threshold: 0.0
+    alpha1: 0.9
+    alpha2: 0.2
+    beta1: 5.0
+    beta2: 0.001
+  refinement:
+    optimize_poses: false
+    iters: 0
+    batch_iters: 1
+    lr_factor: 0.1
+    bs: 40
+    sampling:
+      use_non_keyframes: false
+      kf_at_least: 0.5
+      weighted: false
+      use_neighborhood: false
+      neighborhood_size: 5
+    prune_densify_every: 50
+    densify_until: 250
+    densify:
+      vanilla:
+        max_grad: 0.005
+        extent: 5
+        min_opacity: 0.05
+        max_screen_size: 10
+  feedback:
+    warmup: 5
+    disps: false
+    poses: false
+    only_last_window: true
+    no_refinement: false
+    kwargs:
+      opacity_threshold: 0.1
+      ignore_frames:
+      - 0
+      - 1
+      - 2
+      - 3
+      - 4
+      - 5
+      - 6
+      min_coverage: 0.5
+      max_diff_to_video: 0.2
+  input:
+    sensor_type: depth
+    pcd_downsample_init: 16
+    pcd_downsample: 128
+    adaptive_pointsize: false
+    point_size: 0.02
+    type: replica
+  use_spherical_harmonics: false
+  pipeline_params:
+    convert_SHs_python: false
+    compute_cov3D_python: false
+tracking:
+  pretrained: ./pretrained/droid.pth
+  buffer: 256
+  beta: 0.5
+  warmup: 8
+  upsample: true
+  motion_filter:
+    thresh: 4.0
+  frontend:
+    optimize_scales: true
+    steps1: 4
+    steps2: 2
+    iters: 4
+    max_age: 20
+    keyframe_thresh: 4.0
+    thresh: 15.0
+    window: 25
+    max_factors: 150
+    radius: 5
+    nms: 1
+    release_cache: true
+    pose_interpolation: linear
+  backend:
+    warmup: 25
+    do_refinement: true
+    window: 150
+    thresh: 60.0
+    max_factor_mult: 16
+    radius: 2
+    nms: 2
+    use_loop_closure: false
+    loop_window: 40
+    loop_thresh: 50.0
+    loop_radius: 5
+    loop_nms: 12
+    loop_max_factor_mult: 16
+loop_closure:
+  min_temporal_distance: 10
+  max_orientation_difference: 15.0
+  threshold: 0.5
+  method: eigen
+  model: ResNet50
+  fc_output_dim: 2048
+  k_nearest: 10
+data:
+  dataset: tumrgbd
+  input_folder: /home/XT/gsslam/3_datasets/TUM_RGBD-SLAM/rgbd_dataset_freiburg1_desk
+  png_depth_scale: 5000.0
+  cam:
+    H: 480
+    W: 640
+    H_out: 320
+    W_out: 432
+    H_edge: 8
+    W_edge: 8
+    camera_model: pinhole
+    fx: 517.3
+    fy: 516.5
+    cx: 318.6
+    cy: 255.3
+    distortion:
+    - 0.2624
+    - -0.9531
+    - -0.0054
+    - 0.0026
+    - 1.1633

@@ -1,0 +1,3 @@
+commit=989a3f6da58057d212afe9ed047d730d496d989b
+commit_time=2026-07-22T22:01:17+08:00
+subject=refactor(m01): organize resource admission module tracking

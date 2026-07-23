@@ -1,0 +1,92 @@
+{
+  "experiment_id": "001_official_baseline_fr1desk_full_eval_r1",
+  "experiment_role": "official_full_sequence_baseline",
+  "summary_type": "derived_from_official_outputs",
+  "code": {
+    "commit": "f0cb0316e1ee7f88f8a63c37a6fe19dd623e6eb2",
+    "expected_official_commit": "f0cb0316e1ee7f88f8a63c37a6fe19dd623e6eb2",
+    "worktree_clean": true,
+    "m01_enabled": false
+  },
+  "dataset": {
+    "name": "TUM_RGB-D fr1/desk",
+    "path": "/home/XT/gsslam/3_datasets/TUM_RGBD-SLAM/rgbd_dataset_freiburg1_desk",
+    "mode": "rgbd",
+    "full_sequence": true,
+    "evaluated_frames_seen_in_log": 592
+  },
+  "stability": {
+    "exit_code": 0,
+    "traceback_count": 0,
+    "cuda_error_count": 0,
+    "cuda_ipc_shutdown_warning_count": 2
+  },
+  "map": {
+    "final_gaussians_from_ply": 67554,
+    "final_ply": "/home/XT/gsslam/1_droidsplat/records/001_official_baseline_fr1desk_full_eval_r1/mesh/final_rgbd.ply"
+  },
+  "timing": {
+    "wall_seconds_including_evaluation": 299,
+    "online_slam_minutes_reported": 2.5,
+    "online_total_fps_reported": 3.95
+  },
+  "trajectory": {
+    "all_frame_ate_rmse_m": 0.015212730787322512,
+    "all_frame_ate_mean_m": 0.013152345954708957,
+    "keyframe_ate_rmse_m": 0.017720341390080198,
+    "keyframe_ate_mean_m": 0.01543003836840121
+  },
+  "rendering": {
+    "keyframes": {
+      "psnr": 23.672270263450734,
+      "ssim": 0.9995686489602794,
+      "lpips": 0.20065143963564996,
+      "depth_l1": 0.038756310183932816,
+      "saved_rgb_images": 69,
+      "saved_depth_images": 69
+    },
+    "non_keyframes": {
+      "psnr": 22.84909162975493,
+      "ssim": 0.9995092471440633,
+      "lpips": 0.2178446793840045,
+      "depth_l1": 0.03633912093937397,
+      "saved_rgb_images": 105,
+      "saved_depth_images": 105
+    }
+  },
+  "resources_nvidia_smi": {
+    "sampling_interval_seconds": 1,
+    "online_slam_samples": 171,
+    "online_slam_mean_vram_mib": 5182.87,
+    "online_slam_peak_vram_mib": 8903.0,
+    "evaluation_samples": 123,
+    "evaluation_mean_vram_mib": 2365.27,
+    "evaluation_peak_vram_mib": 2527.0,
+    "end_to_end_samples": 294,
+    "end_to_end_mean_vram_mib": 4004.08,
+    "end_to_end_peak_vram_mib": 8903.0,
+    "phase_boundary_note": "按日志时间精确到秒划分，边界附近最多存在一个采样点误差。"
+  },
+  "validation": {
+    "status": "PASS",
+    "checks": {
+      "official_commit": true,
+      "worktree_clean": true,
+      "full_sequence_no_t_stop": true,
+      "evaluate_enabled": true,
+      "render_images_enabled": true,
+      "save_predictions_enabled": true,
+      "exit_code_zero": true,
+      "traceback_zero": true,
+      "cuda_error_zero": true,
+      "all_frame_ate_exists": true,
+      "keyframe_ate_exists": true,
+      "keyframe_render_metrics_exist": true,
+      "non_keyframe_render_metrics_exist": true,
+      "final_ply_exists": true,
+      "trajectory_files_exist": true,
+      "rendered_rgb_exists": true,
+      "gpu_monitor_exists": true
+    }
+  }
+}

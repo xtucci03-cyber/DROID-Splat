@@ -1,0 +1,16 @@
+experiment=002_m01_observe_fr1desk_full_eval_r1
+status=PASS
+observe_commit=PASS
+worktree_clean=PASS
+full_sequence_no_t_stop=PASS
+evaluate_enabled=PASS
+render_images_enabled=PASS
+save_predictions_enabled=PASS
+exit_code_zero=PASS
+traceback_zero=PASS
+cuda_error_zero=PASS
+m01_events_exist=PASS
+observe_all_passthrough=PASS
+final_ply_exists=PASS
+official_evaluation_exists=PASS
+gpu_monitor_exists=PASS
