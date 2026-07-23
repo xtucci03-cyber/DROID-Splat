@@ -106,7 +106,11 @@ class GaussianMapper(object):
 
         self.resource_admission = None
         if resource_admission_mode != "disabled":
-            self.resource_admission = ResourceAdmission(mode=resource_admission_mode)
+            self.resource_admission = ResourceAdmission(
+                mode=resource_admission_mode,
+                fixed_budget=resource_admission_cfg.get("fixed_budget", None),
+                selection=resource_admission_cfg.get("selection", None),
+            )
 
         self.gaussians = GaussianModel(
             self.sh_degree,

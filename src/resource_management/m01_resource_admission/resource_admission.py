@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 import json
+from numbers import Integral
 import time
 from typing import Any, Dict, Optional
 
@@ -31,34 +32,64 @@ class AdmissionResult:
     protected_init: bool
     admission_cpu_ms: float
     reason: str
+    fixed_budget: Optional[int] = None
+    selection: Optional[str] = None
 
     _tensor_metadata: Dict[str, Any] = field(default_factory=dict, repr=False)
     _before_cpu_ns: int = field(default=0, repr=False)
 
 
 class ResourceAdmission:
-    """Observe-only ResourceAdmission implementation.
+    """ResourceAdmission candidate observation and fixed-budget control.
 
     Disabled mode is represented by None and must not construct this class.
-    Control mode is intentionally unavailable in this atomic change.
+    Generic control mode is intentionally unavailable.
     """
 
-    def __init__(self, mode: str):
+    def __init__(
+        self,
+        mode: str,
+        fixed_budget: Optional[int] = None,
+        selection: Optional[str] = None,
+    ):
         normalized_mode = str(mode).strip().lower()
 
         if normalized_mode == "control":
             raise NotImplementedError(
                 "ResourceAdmission control mode is not implemented in the "
-                "observe-only atomic change."
+                "fixed-budget atomic change."
             )
 
         if normalized_mode == "disabled":
             raise ValueError("ResourceAdmission disabled mode must be represented by None.")
 
-        if normalized_mode != "observe":
+        if normalized_mode not in {"observe", "fixed_budget"}:
             raise ValueError(f"Unsupported ResourceAdmission mode: {normalized_mode!r}")
 
         self.mode = normalized_mode
+        self.fixed_budget: Optional[int] = None
+        self.selection: Optional[str] = None
+
+        if self.mode == "fixed_budget":
+            if isinstance(fixed_budget, bool) or not isinstance(fixed_budget, Integral):
+                raise TypeError("fixed_budget must be an integer and must not be bool.")
+            if fixed_budget < 1:
+                raise ValueError("fixed_budget must be greater than or equal to 1.")
+
+            normalized_selection = (
+                str(selection).strip().lower()
+                if selection is not None
+                else None
+            )
+
+            if normalized_selection != "deterministic_uniform":
+                raise ValueError(
+                    "fixed_budget selection must be 'deterministic_uniform', "
+                    f"got {selection!r}."
+                )
+
+            self.fixed_budget = int(fixed_budget)
+            self.selection = normalized_selection
 
     @staticmethod
     def _read_tensor_metadata(name: str, tensor: torch.Tensor) -> Dict[str, Any]:
@@ -69,7 +100,66 @@ class ResourceAdmission:
             f"{name}_requires_grad": bool(tensor.requires_grad),
         }
 
-    def observe_before_extend(
+    @staticmethod
+    def _validate_fixed_budget_contract(
+        *,
+        xyz: torch.Tensor,
+        features: torch.Tensor,
+        scales: torch.Tensor,
+        rotations: torch.Tensor,
+        opacities: torch.Tensor,
+    ) -> int:
+        tensors = {
+            "xyz": xyz,
+            "features": features,
+            "scales": scales,
+            "rotations": rotations,
+            "opacities": opacities,
+        }
+        shapes = {name: list(tensor.shape) for name, tensor in tensors.items()}
+        devices = {name: str(tensor.device) for name, tensor in tensors.items()}
+        candidate_count = int(xyz.shape[0]) if xyz.ndim > 0 else None
+
+        first_dimensions_match = candidate_count is not None and all(
+            tensor.ndim > 0 and int(tensor.shape[0]) == candidate_count for tensor in tensors.values()
+        )
+        devices_match = all(tensor.device == xyz.device for tensor in tensors.values())
+
+        if not first_dimensions_match or not devices_match:
+            raise ValueError(
+                "Fixed-budget candidate contract violation: "
+                f"candidate_count={candidate_count}, shapes={shapes}, devices={devices}."
+            )
+
+        return int(candidate_count)
+
+    @staticmethod
+    def _deterministic_uniform_indices(
+        *,
+        candidate_count: int,
+        fixed_budget: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if fixed_budget == 1:
+            return torch.full(
+                (1,),
+                (candidate_count - 1) // 2,
+                dtype=torch.long,
+                device=device,
+            )
+
+        positions = torch.arange(
+            fixed_budget,
+            dtype=torch.long,
+            device=device,
+        )
+        return torch.div(
+            positions * (candidate_count - 1),
+            fixed_budget - 1,
+            rounding_mode="floor",
+        )
+
+    def admit_before_extend(
         self,
         *,
         xyz: torch.Tensor,
@@ -84,41 +174,83 @@ class ResourceAdmission:
     ) -> AdmissionResult:
         started_ns = time.perf_counter_ns()
 
-        candidate_count = int(xyz.shape[0])
+        if self.mode == "fixed_budget":
+            candidate_count = self._validate_fixed_budget_contract(
+                xyz=xyz,
+                features=features,
+                scales=scales,
+                rotations=rotations,
+                opacities=opacities,
+            )
+        else:
+            candidate_count = int(xyz.shape[0])
+
+        admitted_xyz = xyz
+        admitted_features = features
+        admitted_scales = scales
+        admitted_rotations = rotations
+        admitted_opacities = opacities
+        admitted_count = candidate_count
+        dropped_count = 0
+        selected_indices = None
+        protected_init = bool(init)
+        reason = "observe_passthrough"
+
+        if self.mode == "fixed_budget":
+            if init:
+                reason = "init_protected"
+            elif candidate_count <= self.fixed_budget:
+                reason = "within_budget"
+            else:
+                selected_indices = self._deterministic_uniform_indices(
+                    candidate_count=candidate_count,
+                    fixed_budget=self.fixed_budget,
+                    device=xyz.device,
+                )
+                admitted_xyz = torch.index_select(xyz, 0, selected_indices)
+                admitted_features = torch.index_select(features, 0, selected_indices)
+                admitted_scales = torch.index_select(scales, 0, selected_indices)
+                admitted_rotations = torch.index_select(rotations, 0, selected_indices)
+                admitted_opacities = torch.index_select(opacities, 0, selected_indices)
+                admitted_count = self.fixed_budget
+                dropped_count = candidate_count - self.fixed_budget
+                reason = "fixed_budget_applied"
 
         tensor_metadata: Dict[str, Any] = {}
-        tensor_metadata.update(self._read_tensor_metadata("xyz", xyz))
-        tensor_metadata.update(self._read_tensor_metadata("features", features))
-        tensor_metadata.update(self._read_tensor_metadata("scales", scales))
-        tensor_metadata.update(self._read_tensor_metadata("rotations", rotations))
-        tensor_metadata.update(self._read_tensor_metadata("opacities", opacities))
+        tensor_metadata.update(self._read_tensor_metadata("xyz", admitted_xyz))
+        tensor_metadata.update(self._read_tensor_metadata("features", admitted_features))
+        tensor_metadata.update(self._read_tensor_metadata("scales", admitted_scales))
+        tensor_metadata.update(self._read_tensor_metadata("rotations", admitted_rotations))
+        tensor_metadata.update(self._read_tensor_metadata("opacities", admitted_opacities))
 
         finished_ns = time.perf_counter_ns()
         before_cpu_ns = finished_ns - started_ns
 
         return AdmissionResult(
-            xyz=xyz,
-            features=features,
-            scales=scales,
-            rotations=rotations,
-            opacities=opacities,
+            xyz=admitted_xyz,
+            features=admitted_features,
+            scales=admitted_scales,
+            rotations=admitted_rotations,
+            opacities=admitted_opacities,
             camera_uid=int(camera_uid),
             kf_id=int(kf_id),
             init=bool(init),
             gaussian_before=int(gaussian_before),
             candidate_count=candidate_count,
-            admitted_count=candidate_count,
-            dropped_count=0,
-            selected_indices=None,
+            admitted_count=admitted_count,
+            dropped_count=dropped_count,
+            selected_indices=selected_indices,
             skip_extend=False,
-            protected_init=bool(init),
+            protected_init=protected_init,
             admission_cpu_ms=before_cpu_ns / 1_000_000.0,
-            reason="observe_passthrough",
+            reason=reason,
+            fixed_budget=self.fixed_budget,
+            selection=self.selection,
             _tensor_metadata=tensor_metadata,
             _before_cpu_ns=before_cpu_ns,
         )
 
-    def observe_after_extend(
+    def record_after_extend(
         self,
         result: AdmissionResult,
         *,
@@ -154,6 +286,18 @@ class ResourceAdmission:
             ),
             "reason": result.reason,
         }
+        if self.mode == "fixed_budget":
+            event.update(
+                {
+                    "fixed_budget": result.fixed_budget,
+                    "selection": result.selection,
+                    "selected_indices_count": (
+                        int(result.selected_indices.shape[0])
+                        if result.selected_indices is not None
+                        else 0
+                    ),
+                }
+            )
         event.update(result._tensor_metadata)
 
         finished_ns = time.perf_counter_ns()
