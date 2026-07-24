@@ -1,0 +1,17 @@
+{
+  "events": 69,
+  "init_events": 1,
+  "ordinary_events": 68,
+  "fixed_budget_applied_events": 67,
+  "within_budget_events": 1,
+  "candidate_total": 64678,
+  "ordinary_candidate_total": 57623,
+  "admitted_total": 47853,
+  "dropped_total": 16825,
+  "drop_total_pct": 26.013482173227374,
+  "drop_ordinary_pct": 29.198410356975515,
+  "contract_violations": [],
+  "m01_cpu_mean_ms": 0.37631440579710146,
+  "m01_cpu_max_ms": 6.12066,
+  "last_gaussian_after_extend": 55275
+}

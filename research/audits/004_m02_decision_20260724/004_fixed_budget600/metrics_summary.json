@@ -1,0 +1,126 @@
+{
+  "experiment_id": "004_m01_fixed_budget600_fr1desk_full_eval_r1",
+  "experiment_role": "m01_fixed_budget_600_strong_boundary_ablation",
+  "validation_status": "PASS",
+  "code": {
+    "commit": "eaa3681b17bdba969844cbce4380cf66aeb5fb1f",
+    "expected_commit": "eaa3681b17bdba969844cbce4380cf66aeb5fb1f",
+    "branch": "feat/m01-resource-admission-fixed-budget",
+    "worktree_clean": true
+  },
+  "configuration": {
+    "mode": "fixed_budget",
+    "fixed_budget": 600,
+    "selection": "deterministic_uniform",
+    "init_protected": true
+  },
+  "map": {
+    "final_gaussians_from_ply": 57860,
+    "last_gaussian_after_extend": 55275,
+    "final_ply": "/home/XT/gsslam/1_droidsplat/records/004_m01_fixed_budget600_fr1desk_full_eval_r1/mesh/final_rgbd.ply"
+  },
+  "timing": {
+    "wall_seconds_including_evaluation": 297
+  },
+  "trajectory": {
+    "all_frame_ate_rmse_m": 0.015212923744684475,
+    "keyframe_ate_rmse_m": 0.017720593184087276
+  },
+  "rendering": {
+    "keyframes": {
+      "psnr": 23.534515961356785,
+      "ssim": 0.9995556145474531,
+      "lpips": 0.20188153664702954,
+      "depth_l1": 0.03802795322153015
+    },
+    "non_keyframes": {
+      "psnr": 22.765014866420202,
+      "ssim": 0.9994996303603763,
+      "lpips": 0.21912013093630472,
+      "depth_l1": 0.03489720460382246
+    }
+  },
+  "m01": {
+    "events": 69,
+    "init_events": 1,
+    "ordinary_events": 68,
+    "fixed_budget_applied_events": 67,
+    "within_budget_events": 1,
+    "candidate_total": 64678,
+    "ordinary_candidate_total": 57623,
+    "admitted_total": 47853,
+    "dropped_total": 16825,
+    "drop_total_pct": 26.013482173227374,
+    "drop_ordinary_pct": 29.198410356975515,
+    "contract_violations": [],
+    "m01_cpu_mean_ms": 0.37631440579710146,
+    "m01_cpu_max_ms": 6.12066,
+    "last_gaussian_after_extend": 55275
+  },
+  "resources_nvidia_smi": {
+    "online_slam_samples": 168,
+    "online_slam_mean_vram_mib": 5150.113095238095,
+    "online_slam_peak_vram_mib": 8946.0,
+    "evaluation_samples": 125,
+    "evaluation_mean_vram_mib": 2423.704,
+    "evaluation_peak_vram_mib": 3404.0,
+    "end_to_end_samples": 293,
+    "end_to_end_mean_vram_mib": 3986.9692832764504,
+    "end_to_end_peak_vram_mib": 8946.0
+  },
+  "comparison_to_001": {
+    "final_gaussians_delta": -9694,
+    "final_gaussians_delta_pct": -14.350001480297244,
+    "all_frame_ate_delta_m": 1.9295736196356383e-07,
+    "keyframe_psnr_delta_db": -0.13775430209394912,
+    "keyframe_ssim_delta": -1.3034412826296027e-05,
+    "keyframe_lpips_delta": 0.0012300970113795773,
+    "wall_seconds_delta": -2,
+    "online_mean_vram_delta_mib": -32.75690476190448,
+    "online_peak_vram_delta_mib": 43.0
+  },
+  "comparison_to_002": {
+    "final_gaussians_delta": -9560,
+    "final_gaussians_delta_pct": -14.179768614654405,
+    "all_frame_ate_delta_m": 1.0343492464776755e-06,
+    "keyframe_psnr_delta_db": -0.23549605106961735,
+    "keyframe_ssim_delta": -1.998310503747991e-05,
+    "keyframe_lpips_delta": 0.004309153643207275,
+    "wall_seconds_delta": -1,
+    "online_mean_vram_delta_mib": 27.75427170868352,
+    "online_peak_vram_delta_mib": -594.0
+  },
+  "comparison_to_003": {
+    "final_gaussians_delta": -1199,
+    "final_gaussians_delta_pct": -2.0301732166138944,
+    "all_frame_ate_delta_m": -3.135590940344865e-06,
+    "keyframe_psnr_delta_db": -0.056208513785097836,
+    "keyframe_ssim_delta": -1.4593635780157932e-05,
+    "keyframe_lpips_delta": -0.00012492388486862183,
+    "wall_seconds_delta": 1,
+    "online_mean_vram_delta_mib": 45.03525092671862,
+    "online_peak_vram_delta_mib": -511.0
+  },
+  "validation": {
+    "status": "PASS",
+    "checks": {
+      "commit_correct": true,
+      "branch_correct": true,
+      "worktree_clean": true,
+      "exit_code_zero": true,
+      "full_sequence_no_t_stop": true,
+      "evaluate_enabled": true,
+      "render_images_enabled": true,
+      "save_predictions_enabled": true,
+      "pre_run_acceptance_pass": true,
+      "traceback_zero": true,
+      "cuda_error_zero": true,
+      "required_files_exist": true,
+      "event_count_69": true,
+      "one_init_event": true,
+      "ordinary_event_count_68": true,
+      "budget_applied": true,
+      "contract_violations_zero": true
+    }
+  }
+}
