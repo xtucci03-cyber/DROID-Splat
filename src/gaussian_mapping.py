@@ -1,3 +1,4 @@
+import json
 import os
 import ipdb
 from copy import deepcopy
@@ -111,6 +112,17 @@ class GaussianMapper(object):
                 fixed_budget=resource_admission_cfg.get("fixed_budget", None),
                 selection=resource_admission_cfg.get("selection", None),
             )
+
+        lifecycle_observer_cfg = cfg.mapping.get(
+            "lifecycle_observer",
+            None,
+        )
+
+        self.lifecycle_observer_enabled = (
+            bool(lifecycle_observer_cfg.get("enabled", False))
+            if lifecycle_observer_cfg is not None
+            else False
+        )
 
         self.gaussians = GaussianModel(
             self.sh_degree,
@@ -775,7 +787,53 @@ class GaussianMapper(object):
             # Prune and Densify
             if self.last_idx > self.n_last_frames and prune_densify:
                 # General pruning based on opacity and size + densification (from original 3DGS)
-                self.gaussians.densify_and_prune(**self.update_params.densify.vanilla)
+                if self.lifecycle_observer_enabled:
+                    lifecycle_event = self.gaussians.densify_and_prune(
+                        **self.update_params.densify.vanilla,
+                        collect_lifecycle_stats=True,
+                    )
+
+                    if lifecycle_event is None:
+                        raise RuntimeError("Lifecycle Observer expected a densify_and_prune event")
+
+                    scalar_keys = (
+                        "opacity_mask_count",
+                        "view_size_mask_count",
+                        "world_size_mask_count",
+                        "general_prune_union_count",
+                        "prune_overlap_excess_count",
+                        "max_radii2d_nonzero_count",
+                    )
+
+                    scalar_values = torch.stack(
+                        [lifecycle_event[key] for key in scalar_keys]
+                    ).tolist()
+
+                    for key, value in zip(scalar_keys, scalar_values):
+                        lifecycle_event[key] = int(value)
+
+                    lifecycle_event.update(
+                        {
+                            "mapper_update_id": int(self.count),
+                            "mapping_iter": int(iter),
+                            "camera_count": int(len(frames)),
+                        }
+                    )
+
+                    print(
+                        "[LifecycleObserver] "
+                        + json.dumps(
+                            lifecycle_event,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                            sort_keys=True,
+                        ),
+                        flush=True,
+                    )
+                else:
+                    self.gaussians.densify_and_prune(
+                        **self.update_params.densify.vanilla
+                    )
 
         ### Update states
         self.gaussians.optimizer.step()
