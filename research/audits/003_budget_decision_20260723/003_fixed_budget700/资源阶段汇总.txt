@@ -1,0 +1,11 @@
+统计口径=nvidia-smi每秒采样
+online_slam_samples=167
+online_slam_mean_vram_mib=5105.08
+online_slam_peak_vram_mib=9457
+evaluation_samples=124
+evaluation_mean_vram_mib=2428.39
+evaluation_peak_vram_mib=3402
+end_to_end_samples=291
+end_to_end_mean_vram_mib=3964.49
+end_to_end_peak_vram_mib=9457
+说明=Peak VRAM为一秒采样瞬时峰值，只作辅助指标

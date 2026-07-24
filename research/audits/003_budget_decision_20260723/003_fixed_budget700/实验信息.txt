@@ -1,0 +1,17 @@
+实验名称=003_m01_fixed_budget700_fr1desk_full_eval_r1
+实验性质=M01 Fixed Candidate Budget完整序列实验
+严格对照=002_m01_observe_fr1desk_full_eval_r1
+参考基线=001_official_baseline_fr1desk_full_eval_r1
+数据集=TUM RGB-D fr1_desk完整序列
+commit=eaa3681b17bdba969844cbce4380cf66aeb5fb1f
+M01模式=fixed_budget
+fixed_budget=700
+selection=deterministic_uniform
+初始化策略=完整保护，不限制
+evaluate=True
+render_images=True
+save_rendered_predictions=True
+离线预计普通事件受影响=61/68
+离线预计候选拒绝=10417
+说明=离线预测不代表最终Gaussian下降比例
+创建时间=2026-07-23T17:53:09+08:00

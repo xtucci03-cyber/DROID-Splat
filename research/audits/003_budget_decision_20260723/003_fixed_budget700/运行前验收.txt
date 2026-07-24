@@ -1,0 +1,3 @@
+CPU PASS: init_protected, within_passthrough, uniform_indices, aligned_attributes, rng_unchanged, json_log
+CUDA PASS: init_protected, within_passthrough, uniform_indices, aligned_attributes, rng_unchanged, json_log
+===== 003 FIXED-BUDGET700 PRE-RUN ACCEPTANCE PASS =====

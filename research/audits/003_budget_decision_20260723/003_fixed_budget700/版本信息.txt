@@ -1,0 +1,3 @@
+commit=eaa3681b17bdba969844cbce4380cf66aeb5fb1f
+commit_time=2026-07-23T13:52:34+08:00
+subject=feat(m01): add deterministic fixed candidate budget
