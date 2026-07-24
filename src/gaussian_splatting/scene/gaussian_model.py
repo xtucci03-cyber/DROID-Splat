@@ -627,8 +627,19 @@ class GaussianModel:
         if new_n_opt is not None:
             self.n_optimized = torch.cat((self.n_optimized, new_n_opt)).int()
 
-    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2, scale_std: float = 1.0):
+    def densify_and_split(
+        self,
+        grads,
+        grad_threshold,
+        scene_extent,
+        N=2,
+        scale_std: float = 1.0,
+        collect_lifecycle_stats: bool = False,
+    ):
         n_init_points = self.get_xyz.shape[0]
+        if collect_lifecycle_stats:
+            split_before = int(n_init_points)
+
         # Extract points that satisfy the gradient condition
         padded_grad = torch.zeros((n_init_points), device=self.device)
         padded_grad[: grads.shape[0]] = grads.squeeze()
@@ -654,6 +665,9 @@ class GaussianModel:
         new_n_obs = self.n_obs[selected_pts_mask].repeat(N)
         new_n_opt = self.n_optimized[selected_pts_mask].repeat(N)
 
+        if collect_lifecycle_stats:
+            split_parent_selected = int(new_xyz.shape[0]) // N
+
         self.densification_postfix(
             new_xyz,
             new_features_dc,
@@ -666,6 +680,10 @@ class GaussianModel:
             new_n_opt=new_n_opt,
         )
 
+        if collect_lifecycle_stats:
+            split_after_children = int(self.get_xyz.shape[0])
+            split_children_added = split_after_children - split_before
+
         prune_filter = torch.cat(
             (
                 selected_pts_mask,
@@ -674,6 +692,18 @@ class GaussianModel:
         )
 
         self.prune_points(prune_filter)
+
+        if collect_lifecycle_stats:
+            split_after_parent_prune = int(self.get_xyz.shape[0])
+            split_parent_removed = split_after_children - split_after_parent_prune
+
+            return {
+                "split_parent_selected": split_parent_selected,
+                "split_children_added": split_children_added,
+                "split_parent_removed": split_parent_removed,
+                "split_after_children": split_after_children,
+                "split_after_parent_prune": split_after_parent_prune,
+            }
 
     def densify_and_clone(self, grads, grad_threshold, scene_extent):
         # Extract points that satisfy the gradient condition
@@ -713,25 +743,134 @@ class GaussianModel:
             fused_point_cloud, features, scales, rots, opacities = features
             self.extend_from_pcd(fused_point_cloud, features, scales, rots, opacities, cam.uid)
 
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, scale_std=1.0):
+    def densify_and_prune(
+        self,
+        max_grad,
+        min_opacity,
+        extent,
+        max_screen_size,
+        scale_std=1.0,
+        collect_lifecycle_stats: bool = False,
+    ):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
         n_g = self.get_xyz.shape[0]
 
+        if collect_lifecycle_stats:
+            gaussian_before = int(n_g)
+            clone_before = gaussian_before
+
         self.densify_and_clone(grads, max_grad, extent)
+
+        if collect_lifecycle_stats:
+            clone_after = int(self.get_xyz.shape[0])
+            clone_added = clone_after - clone_before
+            split_before = clone_after
+
         # New points are seeded within normal deviation with mean and std=scale, i.e. around the current point
         # We allow to manually change the standard deviation to have many more points lie with high chance very close to old Gaussian!
-        self.densify_and_split(grads, max_grad, extent, scale_std=scale_std)
+        if collect_lifecycle_stats:
+            split_stats = self.densify_and_split(
+                grads,
+                max_grad,
+                extent,
+                scale_std=scale_std,
+                collect_lifecycle_stats=True,
+            )
+        else:
+            self.densify_and_split(grads, max_grad, extent, scale_std=scale_std)
 
-        prune_mask = (self.get_opacity < min_opacity).squeeze()
+        if collect_lifecycle_stats:
+            split_parent_selected = split_stats["split_parent_selected"]
+            split_after_children = split_stats["split_after_children"]
+            split_children_added = split_after_children - split_before
+            split_parent_removed = split_stats["split_parent_removed"]
+            split_after = int(self.get_xyz.shape[0])
+            split_net = split_children_added - split_parent_removed
+            general_prune_before = split_after
+
+        opacity_mask = (self.get_opacity < min_opacity).squeeze()
+        prune_mask = opacity_mask
         if max_screen_size:
-            big_points_vs = self.max_radii2D > max_screen_size  # Size
-            big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
-            prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
+            view_size_mask = self.max_radii2D > max_screen_size  # Size
+            world_size_mask = self.get_scaling.max(dim=1).values > 0.1 * extent
+            prune_mask = torch.logical_or(
+                torch.logical_or(opacity_mask, view_size_mask),
+                world_size_mask,
+            )
+        elif collect_lifecycle_stats:
+            view_size_mask = torch.zeros_like(opacity_mask, dtype=torch.bool)
+            world_size_mask = torch.zeros_like(opacity_mask, dtype=torch.bool)
+
+        if collect_lifecycle_stats:
+            opacity_mask_count = torch.count_nonzero(opacity_mask)
+            view_size_mask_count = torch.count_nonzero(view_size_mask)
+            world_size_mask_count = torch.count_nonzero(world_size_mask)
+            general_prune_union_count = torch.count_nonzero(prune_mask)
+            max_radii2d_nonzero_count = torch.count_nonzero(self.max_radii2D)
+            prune_overlap_excess_count = (
+                opacity_mask_count
+                + view_size_mask_count
+                + world_size_mask_count
+                - general_prune_union_count
+            )
 
         self.prune_points(prune_mask)
         self.info(f"Pruning & densification added {self.get_xyz.shape[0] - n_g} gaussians")
+
+        if collect_lifecycle_stats:
+            gaussian_after = int(self.get_xyz.shape[0])
+            general_pruned = general_prune_before - gaussian_after
+            densify_prune_net = gaussian_after - gaussian_before
+
+            conservation_ok = (
+                split_children_added == split_after_children - split_before
+                and split_parent_removed == split_after_children - split_after
+                and split_after == split_stats["split_after_parent_prune"]
+                and gaussian_after
+                == gaussian_before
+                + clone_added
+                + split_children_added
+                - split_parent_removed
+                - general_pruned
+                and densify_prune_net
+                == clone_added + split_net - general_pruned
+            )
+
+            return {
+                "schema": 1,
+                "event_type": "densify_and_prune",
+                "gaussian_before": gaussian_before,
+                "clone_before": clone_before,
+                "clone_added": clone_added,
+                "clone_after": clone_after,
+                "split_before": split_before,
+                "split_parent_selected": split_parent_selected,
+                "split_children_added": split_children_added,
+                "split_after_children": split_after_children,
+                "split_parent_removed": split_parent_removed,
+                "split_net": split_net,
+                "split_after": split_after,
+                "general_prune_before": general_prune_before,
+                "opacity_mask_count": opacity_mask_count,
+                "view_size_mask_count": view_size_mask_count,
+                "world_size_mask_count": world_size_mask_count,
+                "general_prune_union_count": general_prune_union_count,
+                "prune_overlap_excess_count": prune_overlap_excess_count,
+                "max_radii2d_nonzero_count": max_radii2d_nonzero_count,
+                "general_pruned": general_pruned,
+                "gaussian_after": gaussian_after,
+                "densify_prune_net": densify_prune_net,
+                "conservation_ok": conservation_ok,
+                "view_size_measured_post_reset": True,
+                "max_grad": max_grad,
+                "min_opacity": min_opacity,
+                "clone_split_scale_threshold": self.percent_dense * extent,
+                "world_size_threshold": 0.1 * extent,
+                "max_screen_size": max_screen_size,
+                "scale_std": scale_std,
+            }
 
     def add_densification_stats(
         self, viewspace_point_tensor: torch.Tensor, update_filter: torch.Tensor, pixels: Optional[torch.Tensor] = None
