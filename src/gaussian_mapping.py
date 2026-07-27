@@ -25,6 +25,7 @@ from .gaussian_splatting.gaussian_renderer import render
 from .gaussian_splatting.scene.gaussian_model import GaussianModel
 from .gaussian_splatting.camera_utils import Camera
 from .losses import mapping_rgbd_loss, plot_losses
+from .mapping_activity_observer import MappingActivityObserver
 from .resource_management import ResourceAdmission
 
 from .gaussian_splatting.pose_utils import update_pose
@@ -151,6 +152,17 @@ class GaussianMapper(object):
         self._performance_peak_reset = False
         self._performance_pending_gpu_events = []
 
+        activity_observer_cfg = cfg.mapping.get("activity_observer", None)
+        self.mapping_activity_observer = None
+        if (
+            activity_observer_cfg is not None
+            and bool(activity_observer_cfg.get("enabled", False))
+        ):
+            self.mapping_activity_observer = MappingActivityObserver(
+                config=activity_observer_cfg,
+                device=self.device,
+            )
+
         self.gaussians = GaussianModel(
             self.sh_degree,
             config=cfg.mapping.input,
@@ -187,6 +199,19 @@ class GaussianMapper(object):
 
     def info(self, msg: str):
         print(colored("[Gaussian Mapper] " + msg, "magenta"))
+
+    def _mapping_activity_call(self, operation: str, *args, **kwargs):
+        observer = self.mapping_activity_observer
+        if observer is None:
+            return None
+        try:
+            return getattr(observer, operation)(*args, **kwargs)
+        except Exception as error:
+            try:
+                observer.record_error(operation=operation, error=error)
+            except Exception:
+                pass
+            return None
 
     def _performance_cuda_available(self) -> bool:
         return (
@@ -953,15 +978,88 @@ class GaussianMapper(object):
                 view.cam_rot_delta = torch.nn.Parameter(torch.zeros(3, device=self.device))
                 view.cam_trans_delta = torch.nn.Parameter(torch.zeros(3, device=self.device))
 
-    def render_compare(self, view: Camera) -> Tuple[float, Dict, Dict]:
+    def render_compare(
+        self,
+        view: Camera,
+        activity_context: Optional[Dict] = None,
+    ) -> Tuple[float, Dict, Dict]:
         """Render current view and compute loss by comparing with groundtruth"""
-        render_pkg = render(view, self.gaussians, self.pipeline_params, self.background, device=self.device)
+        if activity_context is None:
+            render_pkg = render(
+                view,
+                self.gaussians,
+                self.pipeline_params,
+                self.background,
+                device=self.device,
+            )
+            # NOTE chen: this can be None when self.gaussians is 0. This can happen in some cases
+            if render_pkg is None:
+                return 0.0
+            image, depth = render_pkg["render"], render_pkg["depth"]
+            current_loss = mapping_rgbd_loss(
+                image, depth, view, **self.loss_params
+            )
+            return current_loss, render_pkg
+
+        activity_render_token = self._mapping_activity_call(
+            "begin_stage",
+            activity_context,
+            "render_forward",
+        )
+        try:
+            render_pkg = render(
+                view,
+                self.gaussians,
+                self.pipeline_params,
+                self.background,
+                device=self.device,
+            )
+        finally:
+            self._mapping_activity_call(
+                "end_stage",
+                activity_context,
+                activity_render_token,
+            )
+        self._mapping_activity_call(
+            "memory_boundary",
+            activity_context,
+            "after_forward",
+        )
         # NOTE chen: this can be None when self.gaussians is 0. This can happen in some cases
         if render_pkg is None:
             return 0.0
 
+        self._mapping_activity_call(
+            "observe_render",
+            activity_context,
+            view.uid,
+            render_pkg["visibility_filter"],
+            render_pkg.get("n_touched", None),
+        )
         image, depth = render_pkg["render"], render_pkg["depth"]
-        current_loss = mapping_rgbd_loss(image, depth, view, **self.loss_params)
+        activity_loss_token = self._mapping_activity_call(
+            "begin_stage",
+            activity_context,
+            "loss_computation",
+        )
+        try:
+            current_loss = mapping_rgbd_loss(
+                image,
+                depth,
+                view,
+                **self.loss_params,
+            )
+        finally:
+            self._mapping_activity_call(
+                "end_stage",
+                activity_context,
+                activity_loss_token,
+            )
+        self._mapping_activity_call(
+            "memory_boundary",
+            activity_context,
+            "after_loss",
+        )
         return current_loss, render_pkg
 
     def mapping_step(
@@ -975,6 +1073,18 @@ class GaussianMapper(object):
         # NOTE chen: this can happen we have zero depth and an inconvenient pose
         self.gaussians.check_nans()
 
+        activity_context = None
+        if (
+            self.mapping_activity_observer is not None
+            and self.mapping_activity_observer.has_active_update
+        ):
+            activity_context = self._mapping_activity_call(
+                "begin_iteration",
+                update_id=self.count,
+                iteration_id=iter,
+                gaussian_count=len(self.gaussians),
+            )
+
         if optimize_poses:
             pose_optimizer = self.get_pose_optimizer(frames)
 
@@ -983,7 +1093,13 @@ class GaussianMapper(object):
         radii_acm, touched_acm = [], []
         visibility_filter_acm, viewspace_point_tensor_acm = [], []
         for view in frames:
-            current_loss, render_pkg = self.render_compare(view)
+            if activity_context is None:
+                current_loss, render_pkg = self.render_compare(view)
+            else:
+                current_loss, render_pkg = self.render_compare(
+                    view,
+                    activity_context=activity_context,
+                )
             if render_pkg is None:
                 self.info(f"Skipping view {view.uid} as no gaussians are present ...")
                 continue
@@ -1006,16 +1122,83 @@ class GaussianMapper(object):
         avg_loss = loss / len(frames)  # Average over batch
 
         # Regularizor: Punish anisotropic Gaussians
+        activity_loss_token = None
+        if activity_context is not None:
+            activity_loss_token = self._mapping_activity_call(
+                "begin_stage",
+                activity_context,
+                "loss_computation",
+            )
         scaling = self.gaussians.get_scaling
         isotropic_loss = torch.abs(scaling - scaling.mean(dim=1).view(-1, 1))
         loss += self.loss_params.beta1 * isotropic_loss.mean()
+        if activity_context is not None:
+            self._mapping_activity_call(
+                "end_stage",
+                activity_context,
+                activity_loss_token,
+            )
+            self._mapping_activity_call(
+                "memory_boundary",
+                activity_context,
+                "after_loss",
+            )
 
         # NOTE chen: this can happen we have zero depth and an inconvenient pose
         self.gaussians.check_nans()
-        loss.backward()
+        activity_backward_token = None
+        if activity_context is not None:
+            self._mapping_activity_call(
+                "observe_before_backward",
+                activity_context,
+                gaussian_count=len(self.gaussians),
+            )
+            activity_backward_token = self._mapping_activity_call(
+                "begin_stage",
+                activity_context,
+                "backward",
+            )
+        try:
+            loss.backward()
+        finally:
+            if activity_context is not None:
+                self._mapping_activity_call(
+                    "end_stage",
+                    activity_context,
+                    activity_backward_token,
+                )
+        if activity_context is not None:
+            self._mapping_activity_call(
+                "memory_boundary",
+                activity_context,
+                "after_backward",
+            )
+            self._mapping_activity_call(
+                "observe_after_backward",
+                activity_context,
+                {
+                    "xyz": self.gaussians._xyz,
+                    "features_dc": self.gaussians._features_dc,
+                    "features_rest": self.gaussians._features_rest,
+                    "opacity": self.gaussians._opacity,
+                    "scaling": self.gaussians._scaling,
+                    "rotation": self.gaussians._rotation,
+                },
+            )
+            self._mapping_activity_call(
+                "finalize_activity_masks",
+                activity_context,
+            )
 
         ### Maybe Densify and Prune before update
         with torch.no_grad():
+            activity_densification_token = None
+            if activity_context is not None:
+                activity_densification_token = self._mapping_activity_call(
+                    "begin_stage",
+                    activity_context,
+                    "densification_stats",
+                )
             for idx in range(len(viewspace_point_tensor_acm)):
                 # Dont let Gaussians grow too much by forcing radius to not change
                 self.gaussians.max_radii2D[visibility_filter_acm[idx]] = torch.max(
@@ -1031,10 +1214,28 @@ class GaussianMapper(object):
                 self.gaussians.add_densification_stats(
                     viewspace_point_tensor_acm[idx], visibility_filter_acm[idx], pixels=pixels
                 )
+            if activity_context is not None:
+                self._mapping_activity_call(
+                    "end_stage",
+                    activity_context,
+                    activity_densification_token,
+                )
 
             # Prune and Densify
             if self.last_idx > self.n_last_frames and prune_densify:
                 # General pruning based on opacity and size + densification (from original 3DGS)
+                activity_densify_token = None
+                if activity_context is not None:
+                    activity_densify_token = self._mapping_activity_call(
+                        "begin_stage",
+                        activity_context,
+                        "densify_and_prune",
+                    )
+                    self._mapping_activity_call(
+                        "mark_densify_and_prune",
+                        activity_context,
+                        True,
+                    )
                 performance_densify_token = None
                 if self.performance_monitor_enabled:
                     performance_densify_token = self._performance_stage_begin(
@@ -1092,11 +1293,66 @@ class GaussianMapper(object):
 
                 if self.performance_monitor_enabled:
                     self._performance_stage_end(performance_densify_token)
+                if activity_context is not None:
+                    self._mapping_activity_call(
+                        "end_stage",
+                        activity_context,
+                        activity_densify_token,
+                    )
+            if activity_context is not None:
+                self._mapping_activity_call(
+                    "memory_boundary",
+                    activity_context,
+                    "after_densify_prune",
+                )
 
         ### Update states
-        self.gaussians.optimizer.step()
-        self.gaussians.optimizer.zero_grad()
-        self.gaussians.update_learning_rate(iter)
+        activity_optimizer_token = None
+        if activity_context is not None:
+            activity_optimizer_token = self._mapping_activity_call(
+                "begin_stage",
+                activity_context,
+                "optimizer_step",
+            )
+        try:
+            self.gaussians.optimizer.step()
+        finally:
+            if activity_context is not None:
+                self._mapping_activity_call(
+                    "end_stage",
+                    activity_context,
+                    activity_optimizer_token,
+                )
+        if activity_context is not None:
+            self._mapping_activity_call(
+                "memory_boundary",
+                activity_context,
+                "after_optimizer_step",
+            )
+
+        activity_housekeeping_token = None
+        if activity_context is not None:
+            activity_housekeeping_token = self._mapping_activity_call(
+                "begin_stage",
+                activity_context,
+                "zero_grad_housekeeping",
+            )
+        try:
+            self.gaussians.optimizer.zero_grad()
+            self.gaussians.update_learning_rate(iter)
+        finally:
+            if activity_context is not None:
+                self._mapping_activity_call(
+                    "end_stage",
+                    activity_context,
+                    activity_housekeeping_token,
+                )
+        if activity_context is not None:
+            self._mapping_activity_call(
+                "memory_boundary",
+                activity_context,
+                "after_zero_grad",
+            )
 
         # Delete lists of tensors
         del radii_acm
@@ -1114,6 +1370,12 @@ class GaussianMapper(object):
                 update_pose(view)
             del pose_optimizer  # We define a new one every time anyways
 
+        if activity_context is not None:
+            self._mapping_activity_call(
+                "end_iteration",
+                activity_context,
+                gaussian_count=len(self.gaussians),
+            )
         return avg_loss.detach().item()
 
     def covisibility_pruning(
@@ -1407,6 +1669,15 @@ class GaussianMapper(object):
                 stage="mapper_update"
             )
 
+        if self.mapping_activity_observer is not None:
+            self._mapping_activity_call(
+                "begin_update",
+                update_id=self.count,
+                update_kind=("online" if delay_to_tracking else "final"),
+                configured_iteration_total=iters,
+                gaussian_count=len(self.gaussians),
+            )
+
         self.info("Currently has: {} gaussians".format(len(self.gaussians)))
 
         ### Filter map based on multiview_consistency and uncertainty
@@ -1450,6 +1721,13 @@ class GaussianMapper(object):
                     new_camera_count=len(self.new_cameras),
                 )
                 self._performance_flush_gpu_events(performance_update_end_event)
+            if self.mapping_activity_observer is not None:
+                self._mapping_activity_call(
+                    "end_update",
+                    gaussian_count=len(self.gaussians),
+                    status="skipped",
+                    reason="no_gaussians",
+                )
             return
 
         ### Optimize gaussians
@@ -1547,6 +1825,11 @@ class GaussianMapper(object):
                 new_camera_count=performance_new_camera_count,
             )
             self._performance_flush_gpu_events(performance_update_end_event)
+        if self.mapping_activity_observer is not None:
+            self._mapping_activity_call(
+                "end_update",
+                gaussian_count=len(self.gaussians),
+            )
 
     def __call__(self, mapping_queue: mp.Queue, received_item: mp.Event, the_end=False):
 
@@ -1595,6 +1878,11 @@ class GaussianMapper(object):
                 self._last_call(
                     mapping_queue=mapping_queue,
                     received_item=received_item,
+                )
+            if self.mapping_activity_observer is not None:
+                self._mapping_activity_call(
+                    "finalize",
+                    gaussian_count=len(self.gaussians),
                 )
             return True
 

@@ -47,6 +47,19 @@ online_opt:
     uncertainty: False # Only use very certain points for intializing Gaussians
     conf_th: 0.025 # Only take pixels above this confidence (Usually dynamic objects and obvious unuseful pixels like sky are below 0.1) 
 
+# Default-off diagnostics for active Gaussian work inside Mapping Optimization.
+activity_observer:
+  enabled: false
+  sample_every: 1
+  log_iteration_events: true
+  log_update_summary: true
+  collect_visible: true
+  collect_touched_proxy: true
+  collect_gradient_active: true
+  collect_cuda_timing: true
+  collect_memory: true
+  gradient_eps: 0.0
+
 
 # MonoGS uses their defaults for a window size of 10
 # Since we want to independent to the batch_size, we adjust the learning rate accordingly
