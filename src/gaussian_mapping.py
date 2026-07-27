@@ -2,6 +2,7 @@ import json
 import os
 import ipdb
 from copy import deepcopy
+from datetime import datetime, timezone
 from typing import List, Dict, Optional, Tuple
 import time
 import ipdb
@@ -124,6 +125,32 @@ class GaussianMapper(object):
             else False
         )
 
+        performance_monitor_cfg = cfg.mapping.get("performance_monitor", None)
+        self.performance_monitor_enabled = (
+            bool(performance_monitor_cfg.get("enabled", False))
+            if performance_monitor_cfg is not None
+            else False
+        )
+        self.performance_monitor_gpu_timing = (
+            bool(performance_monitor_cfg.get("gpu_timing", False))
+            if performance_monitor_cfg is not None
+            else False
+        )
+        self.performance_monitor_memory_sampling = (
+            bool(performance_monitor_cfg.get("memory_sampling", False))
+            if performance_monitor_cfg is not None
+            else False
+        )
+        self.performance_monitor_log_events = (
+            bool(performance_monitor_cfg.get("log_events", True))
+            if performance_monitor_cfg is not None
+            else True
+        )
+        self._performance_event_counter = 0
+        self._performance_process_started = False
+        self._performance_peak_reset = False
+        self._performance_pending_gpu_events = []
+
         self.gaussians = GaussianModel(
             self.sh_degree,
             config=cfg.mapping.input,
@@ -160,6 +187,227 @@ class GaussianMapper(object):
 
     def info(self, msg: str):
         print(colored("[Gaussian Mapper] " + msg, "magenta"))
+
+    def _performance_cuda_available(self) -> bool:
+        return (
+            self.performance_monitor_enabled
+            and torch.device(self.device).type == "cuda"
+            and torch.cuda.is_available()
+        )
+
+    def _performance_memory_snapshot(self) -> Dict[str, Optional[int]]:
+        snapshot = {
+            "memory_allocated_bytes": None,
+            "memory_reserved_bytes": None,
+            "max_memory_allocated_bytes": None,
+            "max_memory_reserved_bytes": None,
+        }
+        if not self.performance_monitor_enabled or not self.performance_monitor_memory_sampling:
+            return snapshot
+        if not self._performance_cuda_available():
+            return snapshot
+
+        snapshot.update(
+            {
+                "memory_allocated_bytes": int(torch.cuda.memory_allocated(device=self.device)),
+                "memory_reserved_bytes": int(torch.cuda.memory_reserved(device=self.device)),
+                "max_memory_allocated_bytes": int(torch.cuda.max_memory_allocated(device=self.device)),
+                "max_memory_reserved_bytes": int(torch.cuda.max_memory_reserved(device=self.device)),
+            }
+        )
+        return snapshot
+
+    def _performance_resource_admission_mode(self) -> str:
+        if self.resource_admission is None:
+            return "disabled"
+        return str(self.resource_admission.mode)
+
+    def _performance_build_event(
+        self,
+        event_type: str,
+        stage: str,
+        phase: str,
+        status: str = "ok",
+        reason: Optional[str] = None,
+        mapping_iter: Optional[int] = None,
+        new_camera_count: Optional[int] = None,
+        cpu_wall_ms: Optional[float] = None,
+        gpu_elapsed_ms: Optional[float] = None,
+        memory_snapshot: Optional[Dict[str, Optional[int]]] = None,
+    ) -> Dict:
+        self._performance_event_counter += 1
+        pid = os.getpid()
+        event = {
+            "schema": 1,
+            "event_id": f"mapper:{pid}:{self._performance_event_counter}",
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "perf_counter_ns": time.perf_counter_ns(),
+            "process_role": "mapper",
+            "pid": pid,
+            "cuda_device": str(self.device),
+            "event_type": event_type,
+            "stage": stage,
+            "phase": phase,
+            "status": status,
+            "reason": reason,
+            "mapper_update_id": int(self.count),
+            "mapping_iter": int(mapping_iter) if mapping_iter is not None else None,
+            "new_camera_count": int(new_camera_count) if new_camera_count is not None else None,
+            "gaussian_count": int(len(self.gaussians)),
+            "cpu_wall_ms": float(cpu_wall_ms) if cpu_wall_ms is not None else None,
+            "gpu_elapsed_ms": float(gpu_elapsed_ms) if gpu_elapsed_ms is not None else None,
+            "resource_admission_mode": self._performance_resource_admission_mode(),
+            "lifecycle_observer_enabled": bool(self.lifecycle_observer_enabled),
+        }
+        event.update(memory_snapshot or self._performance_memory_snapshot())
+        return event
+
+    def _performance_emit_event(self, event: Dict) -> None:
+        if not self.performance_monitor_enabled or not self.performance_monitor_log_events:
+            return
+        print(
+            "[PerformanceResourceMonitor] "
+            + json.dumps(
+                event,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+
+    def _performance_stage_begin(
+        self,
+        stage: str,
+        mapping_iter: Optional[int] = None,
+        new_camera_count: Optional[int] = None,
+    ) -> Optional[Dict]:
+        if not self.performance_monitor_enabled:
+            return None
+
+        begin_event = self._performance_build_event(
+            event_type="stage_timing",
+            stage=stage,
+            phase="begin",
+            mapping_iter=mapping_iter,
+            new_camera_count=new_camera_count,
+        )
+        self._performance_emit_event(begin_event)
+
+        gpu_start = None
+        if self.performance_monitor_gpu_timing and self._performance_cuda_available():
+            gpu_start = torch.cuda.Event(enable_timing=True)
+            gpu_start.record()
+
+        return {
+            "stage": stage,
+            "mapping_iter": mapping_iter,
+            "new_camera_count": new_camera_count,
+            "cpu_start_ns": time.perf_counter_ns(),
+            "gpu_start": gpu_start,
+        }
+
+    def _performance_stage_end(
+        self,
+        token: Optional[Dict],
+        status: str = "ok",
+        reason: Optional[str] = None,
+        new_camera_count: Optional[int] = None,
+    ):
+        if not self.performance_monitor_enabled or token is None:
+            return None
+
+        cpu_end_ns = time.perf_counter_ns()
+        gpu_end = None
+        if token["gpu_start"] is not None:
+            gpu_end = torch.cuda.Event(enable_timing=True)
+            gpu_end.record()
+
+        event = self._performance_build_event(
+            event_type="stage_timing",
+            stage=token["stage"],
+            phase="end",
+            status=status,
+            reason=reason,
+            mapping_iter=token["mapping_iter"],
+            new_camera_count=(
+                new_camera_count
+                if new_camera_count is not None
+                else token["new_camera_count"]
+            ),
+            cpu_wall_ms=(cpu_end_ns - token["cpu_start_ns"]) / 1_000_000.0,
+        )
+
+        if gpu_end is not None:
+            self._performance_pending_gpu_events.append(
+                (token["gpu_start"], gpu_end, event)
+            )
+        else:
+            self._performance_emit_event(event)
+        return gpu_end
+
+    def _performance_flush_gpu_events(self, sync_event) -> None:
+        if not self.performance_monitor_enabled:
+            return
+        if sync_event is None or not self._performance_pending_gpu_events:
+            return
+
+        sync_event.synchronize()
+        for start_event, end_event, event in self._performance_pending_gpu_events:
+            event["gpu_elapsed_ms"] = float(start_event.elapsed_time(end_event))
+            self._performance_emit_event(event)
+        self._performance_pending_gpu_events.clear()
+
+    def _performance_emit_skipped(
+        self,
+        stage: str,
+        reason: str,
+        mapping_iter: Optional[int] = None,
+    ) -> None:
+        if not self.performance_monitor_enabled:
+            return
+        self._performance_emit_event(
+            self._performance_build_event(
+                event_type="stage_timing",
+                stage=stage,
+                phase="summary",
+                status="skipped",
+                reason=reason,
+                mapping_iter=mapping_iter,
+            )
+        )
+
+    def _performance_ensure_process_started(self) -> None:
+        if not self.performance_monitor_enabled or self._performance_process_started:
+            return
+
+        if (
+            self.performance_monitor_memory_sampling
+            and self._performance_cuda_available()
+            and not self._performance_peak_reset
+        ):
+            torch.cuda.reset_peak_memory_stats(device=self.device)
+            self._performance_peak_reset = True
+
+        self._performance_process_started = True
+        self._performance_emit_event(
+            self._performance_build_event(
+                event_type="process_lifecycle",
+                stage="process",
+                phase="begin",
+            )
+        )
+
+    def _performance_process_finished(self) -> None:
+        if not self.performance_monitor_enabled:
+            return
+        self._performance_emit_event(
+            self._performance_build_event(
+                event_type="process_lifecycle",
+                stage="process",
+                phase="end",
+            )
+        )
 
     def save_render(self, cam: Camera, render_path: str) -> None:
         """Save a rendered frame"""
@@ -787,6 +1035,13 @@ class GaussianMapper(object):
             # Prune and Densify
             if self.last_idx > self.n_last_frames and prune_densify:
                 # General pruning based on opacity and size + densification (from original 3DGS)
+                performance_densify_token = None
+                if self.performance_monitor_enabled:
+                    performance_densify_token = self._performance_stage_begin(
+                        stage="densify_and_prune",
+                        mapping_iter=iter,
+                    )
+
                 if self.lifecycle_observer_enabled:
                     lifecycle_event = self.gaussians.densify_and_prune(
                         **self.update_params.densify.vanilla,
@@ -834,6 +1089,9 @@ class GaussianMapper(object):
                     self.gaussians.densify_and_prune(
                         **self.update_params.densify.vanilla
                     )
+
+                if self.performance_monitor_enabled:
+                    self._performance_stage_end(performance_densify_token)
 
         ### Update states
         self.gaussians.optimizer.step()
@@ -1058,6 +1316,12 @@ class GaussianMapper(object):
 
         # Export Cameras and Gaussians to the main Process
         # NOTE chen: we safeguard against None Queues in case we are in test mode ...
+        performance_packet_token = None
+        if self.performance_monitor_enabled and mapping_queue is not None:
+            performance_packet_token = self._performance_stage_begin(
+                stage="evaluate_packet_transfer"
+            )
+
         if self.evaluate and mapping_queue is not None:
             mapping_queue.put(
                 EvaluatePacket(
@@ -1074,6 +1338,16 @@ class GaussianMapper(object):
                 mapping_queue.put("None")
         if received_item is not None:
             received_item.wait()  # Wait until the Packet got delivered
+
+        if self.performance_monitor_enabled and performance_packet_token is not None:
+            self._performance_stage_end(
+                performance_packet_token,
+            )
+        elif self.performance_monitor_enabled:
+            self._performance_emit_skipped(
+                stage="evaluate_packet_transfer",
+                reason="mapping_queue_unavailable",
+            )
 
     def add_new_gaussians(self, cameras: List[Camera]) -> Camera | None:
         """Initialize new Gaussians based on the provided views (images, poses (, depth))"""
@@ -1127,6 +1401,12 @@ class GaussianMapper(object):
         iv) Prune the resulting Gaussians based on visibility and size
         v) Maybe send back a filtered update to the SLAM system
         """
+        performance_update_token = None
+        if self.performance_monitor_enabled:
+            performance_update_token = self._performance_stage_begin(
+                stage="mapper_update"
+            )
+
         self.info("Currently has: {} gaussians".format(len(self.gaussians)))
 
         ### Filter map based on multiview_consistency and uncertainty
@@ -1146,13 +1426,40 @@ class GaussianMapper(object):
         ### Update the frames based on Tracker and add new Gaussians
         self.frame_updater(delay=delay)  # Update all changed cameras with new information from SLAM system
 
-        last_new_cam = self.add_new_gaussians(self.new_cameras)
+        if self.performance_monitor_enabled:
+            performance_add_token = self._performance_stage_begin(
+                stage="add_new_gaussians",
+                new_camera_count=len(self.new_cameras),
+            )
+            last_new_cam = self.add_new_gaussians(self.new_cameras)
+            self._performance_stage_end(
+                performance_add_token,
+                new_camera_count=len(self.new_cameras),
+            )
+        else:
+            last_new_cam = self.add_new_gaussians(self.new_cameras)
+
         # We might have 0 Gaussians in some cases, so no need to run optimizer
         if len(self.gaussians) == 0:
             self.info("No Gaussians to optimize, skipping mapping step ...")
+            if self.performance_monitor_enabled:
+                performance_update_end_event = self._performance_stage_end(
+                    performance_update_token,
+                    status="skipped",
+                    reason="no_gaussians",
+                    new_camera_count=len(self.new_cameras),
+                )
+                self._performance_flush_gpu_events(performance_update_end_event)
             return
 
         ### Optimize gaussians
+        performance_optimization_token = None
+        if self.performance_monitor_enabled:
+            performance_optimization_token = self._performance_stage_begin(
+                stage="mapping_optimization",
+                new_camera_count=len(self.new_cameras),
+            )
+
         for iter in tqdm(range(iters), desc=colored("Gaussian Optimization", "magenta"), colour="magenta"):
             do_densify = (
                 iter % self.update_params.prune_densify_every == 0 and iter < self.update_params.prune_densify_until
@@ -1163,6 +1470,12 @@ class GaussianMapper(object):
             )
             self.loss_list.append(loss)
 
+        if self.performance_monitor_enabled:
+            self._performance_stage_end(
+                performance_optimization_token,
+                new_camera_count=len(self.new_cameras),
+            )
+
         # Keep track of how well the Rendering is doing
         print(colored("\n[Gaussian Mapper] ", "magenta"), colored(f"Loss: {self.loss_list[-1]}", "cyan"))
 
@@ -1170,7 +1483,32 @@ class GaussianMapper(object):
         if len(self.iteration_info) % self.update_params.prune_every == 0 and delay_to_tracking:
             if self.update_params.pruning.use_covisibility:
                 # Gaussians should be visible in multiple frames
-                self.covisibility_pruning(**self.update_params.pruning.covisibility)
+                if self.performance_monitor_enabled:
+                    performance_covisibility_token = self._performance_stage_begin(
+                        stage="covisibility_pruning",
+                        new_camera_count=len(self.new_cameras),
+                    )
+                    self.covisibility_pruning(
+                        **self.update_params.pruning.covisibility
+                    )
+                    self._performance_stage_end(
+                        performance_covisibility_token,
+                        new_camera_count=len(self.new_cameras),
+                    )
+                else:
+                    self.covisibility_pruning(
+                        **self.update_params.pruning.covisibility
+                    )
+            elif self.performance_monitor_enabled:
+                self._performance_emit_skipped(
+                    stage="covisibility_pruning",
+                    reason="covisibility_disabled",
+                )
+        elif self.performance_monitor_enabled:
+            self._performance_emit_skipped(
+                stage="covisibility_pruning",
+                reason="schedule_not_triggered",
+            )
 
         ### Feedback new state of map to Tracker
         if (self.feedback_poses or self.feedback_disps) and self.count > self.feedback_params.warmup:
@@ -1198,10 +1536,22 @@ class GaussianMapper(object):
 
         self.iteration_info.append(len(self.new_cameras))
         # Keep track of added cameras
+        if self.performance_monitor_enabled:
+            performance_new_camera_count = len(self.new_cameras)
         self.cameras += self.new_cameras
         self.new_cameras = []
 
+        if self.performance_monitor_enabled:
+            performance_update_end_event = self._performance_stage_end(
+                performance_update_token,
+                new_camera_count=performance_new_camera_count,
+            )
+            self._performance_flush_gpu_events(performance_update_end_event)
+
     def __call__(self, mapping_queue: mp.Queue, received_item: mp.Event, the_end=False):
+
+        if self.performance_monitor_enabled:
+            self._performance_ensure_process_started()
 
         self.cur_idx = self.video.counter.value
 
@@ -1226,7 +1576,26 @@ class GaussianMapper(object):
             self._update(iters=self.mapping_iters + 10, delay_to_tracking=False)
             self.count += 1
 
-            self._last_call(mapping_queue=mapping_queue, received_item=received_item)
+            if self.performance_monitor_enabled:
+                performance_finalize_token = self._performance_stage_begin(
+                    stage="finalize"
+                )
+                self._last_call(
+                    mapping_queue=mapping_queue,
+                    received_item=received_item,
+                )
+                performance_finalize_end_event = self._performance_stage_end(
+                    performance_finalize_token
+                )
+                self._performance_flush_gpu_events(
+                    performance_finalize_end_event
+                )
+                self._performance_process_finished()
+            else:
+                self._last_call(
+                    mapping_queue=mapping_queue,
+                    received_item=received_item,
+                )
             return True
 
         else:

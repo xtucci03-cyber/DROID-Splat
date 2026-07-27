@@ -1,7 +1,9 @@
 import os
 import ipdb
 import gc
-from time import sleep, time, perf_counter
+import json
+from datetime import datetime, timezone
+from time import sleep, time, perf_counter, perf_counter_ns
 from typing import List, Optional, Tuple
 from tqdm import tqdm
 import logging
@@ -75,6 +77,18 @@ class SLAM:
 
         self.cfg = cfg
         self.device = cfg.get("device", torch.device("cuda:0"))
+        performance_monitor_cfg = cfg.mapping.get("performance_monitor", None)
+        self.performance_monitor_enabled = (
+            bool(performance_monitor_cfg.get("enabled", False))
+            if performance_monitor_cfg is not None
+            else False
+        )
+        self.performance_monitor_log_events = (
+            bool(performance_monitor_cfg.get("log_events", True))
+            if performance_monitor_cfg is not None
+            else True
+        )
+        self._performance_event_counter = 0
         self.mode = cfg.get("mode", "mono")
         self.do_evaluate = cfg.get("evaluate", False)
         self.save_predictions = cfg.get("save_rendered_predictions", False)  # save all predictions for later
@@ -183,6 +197,47 @@ class SLAM:
         else:
             print(colored("[Main]: " + msg, "green"))
 
+    def _performance_emit(
+        self,
+        process_role: str,
+        event_type: str,
+        stage: str,
+        phase: str,
+        status: str = "ok",
+        reason: Optional[str] = None,
+        **fields,
+    ) -> None:
+        if not self.performance_monitor_enabled or not self.performance_monitor_log_events:
+            return
+
+        self._performance_event_counter += 1
+        pid = os.getpid()
+        event = {
+            "schema": 1,
+            "event_id": f"{process_role}:{pid}:{self._performance_event_counter}",
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "perf_counter_ns": perf_counter_ns(),
+            "process_role": process_role,
+            "pid": pid,
+            "cuda_device": str(self.device),
+            "event_type": event_type,
+            "stage": stage,
+            "phase": phase,
+            "status": status,
+            "reason": reason,
+        }
+        event.update(fields)
+        print(
+            "[PerformanceResourceMonitor] "
+            + json.dumps(
+                event,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+
     def sanity_checks(self) -> None:
         """Perform sanity checks to see if the system is misconfigured, this is just supposed
         to protect the user when running the system"""
@@ -278,6 +333,15 @@ class SLAM:
         ba_lock: mp.Lock = None,
     ) -> None:
         """Main driver of framework by looping over the input stream"""
+        if self.performance_monitor_enabled:
+            frontend_total_ns = 0
+            frontend_call_count = 0
+            self._performance_emit(
+                process_role="frontend",
+                event_type="process_lifecycle",
+                stage="process",
+                phase="begin",
+            )
 
         def maybe_notify_other_threads_to_start() -> None:
             # Check to notify other threads that they can start
@@ -326,7 +390,13 @@ class SLAM:
                 with communication_lock:
                     cond_mapping.wait_for(lambda: self.mapping_done > 0)
 
-            self.frontend(timestamp, image, depth, intrinsic, gt_pose, static_mask=static_mask, lock=ba_lock)
+            if self.performance_monitor_enabled:
+                frontend_start_ns = perf_counter_ns()
+                self.frontend(timestamp, image, depth, intrinsic, gt_pose, static_mask=static_mask, lock=ba_lock)
+                frontend_total_ns += perf_counter_ns() - frontend_start_ns
+                frontend_call_count += 1
+            else:
+                self.frontend(timestamp, image, depth, intrinsic, gt_pose, static_mask=static_mask, lock=ba_lock)
 
             maybe_notify_other_threads_to_start()
             # Check if we actually inserted a new frame and optimized
@@ -340,6 +410,21 @@ class SLAM:
 
         self.tracking_finished += 1
         self.all_finished += 1
+        if self.performance_monitor_enabled:
+            self._performance_emit(
+                process_role="frontend",
+                event_type="process_summary",
+                stage="frontend",
+                phase="summary",
+                cpu_wall_ms=frontend_total_ns / 1_000_000.0,
+                call_count=frontend_call_count,
+            )
+            self._performance_emit(
+                process_role="frontend",
+                event_type="process_lifecycle",
+                stage="process",
+                phase="end",
+            )
         self.info("Frontend Tracking done!")
 
         # Release the Semaphores to avoid deadlock
@@ -468,6 +553,18 @@ class SLAM:
         loop_queue: Optional[mp.Queue] = None,
         run: bool = False,
     ) -> None:
+        if self.performance_monitor_enabled:
+            backend_online_total_ns = 0
+            backend_online_call_count = 0
+            final_backend_total_ns = 0
+            final_backend_call_count = 0
+            self._performance_emit(
+                process_role="backend",
+                event_type="process_lifecycle",
+                stage="process",
+                phase="begin",
+            )
+
         self.info("Backend thread started!")
         self.all_trigered += 1
 
@@ -502,7 +599,13 @@ class SLAM:
                         all_loop_ii, all_loop_jj = merge_candidates(all_lc_candidates)
 
             ### Actual Backend call
-            self.backend_op(add_ii=all_loop_ii, add_jj=all_loop_jj, lock=ba_lock)
+            if self.performance_monitor_enabled:
+                backend_start_ns = perf_counter_ns()
+                self.backend_op(add_ii=all_loop_ii, add_jj=all_loop_jj, lock=ba_lock)
+                backend_online_total_ns += perf_counter_ns() - backend_start_ns
+                backend_online_call_count += 1
+            else:
+                self.backend_op(add_ii=all_loop_ii, add_jj=all_loop_jj, lock=ba_lock)
 
         sleep(self.sleep_time)  # Let other threads finish their last optimization
         # Try to instantiate again if needed
@@ -525,7 +628,25 @@ class SLAM:
 
                 msg = "Optimize full map: [{}, {}]!".format(0, t_end)
                 self.backend.info(msg)
-                self.final_backend_op(t_start=0, t_end=t_end, add_ii=all_loop_ii, add_jj=all_loop_jj, lock=ba_lock)
+                if self.performance_monitor_enabled:
+                    final_backend_start_ns = perf_counter_ns()
+                    self.final_backend_op(
+                        t_start=0,
+                        t_end=t_end,
+                        add_ii=all_loop_ii,
+                        add_jj=all_loop_jj,
+                        lock=ba_lock,
+                    )
+                    final_backend_total_ns += perf_counter_ns() - final_backend_start_ns
+                    final_backend_call_count += 1
+                else:
+                    self.final_backend_op(
+                        t_start=0,
+                        t_end=t_end,
+                        add_ii=all_loop_ii,
+                        add_jj=all_loop_jj,
+                        lock=ba_lock,
+                    )
 
         if self.backend is not None:
             del self.backend
@@ -534,6 +655,31 @@ class SLAM:
 
         self.backend_finished += 1
         self.all_finished += 1
+        if self.performance_monitor_enabled:
+            self._performance_emit(
+                process_role="backend",
+                event_type="process_summary",
+                stage="backend_online",
+                phase="summary",
+                cpu_wall_ms=backend_online_total_ns / 1_000_000.0,
+                call_count=backend_online_call_count,
+            )
+            self._performance_emit(
+                process_role="backend",
+                event_type="process_summary",
+                stage="final_backend",
+                phase="summary",
+                cpu_wall_ms=final_backend_total_ns / 1_000_000.0,
+                call_count=final_backend_call_count,
+                status="ok" if final_backend_call_count else "skipped",
+                reason=None if final_backend_call_count else "final_backend_not_run",
+            )
+            self._performance_emit(
+                process_role="backend",
+                event_type="process_lifecycle",
+                stage="process",
+                phase="end",
+            )
         self.info("Backend done!")
 
     def maybe_reanchor_gaussians(
@@ -1042,7 +1188,24 @@ class SLAM:
         # self.save_state()  # NOTE we dont save this for now, since the network stays the same
         if self.do_evaluate:
             self.info("Doing evaluation!", logger=log)
-            self.evaluate(stream, gaussian_mapper_last_state=gaussian_mapper_last_state)
+            if self.performance_monitor_enabled:
+                evaluation_start_ns = perf_counter_ns()
+                self._performance_emit(
+                    process_role="main",
+                    event_type="stage_timing",
+                    stage="evaluation",
+                    phase="begin",
+                )
+                self.evaluate(stream, gaussian_mapper_last_state=gaussian_mapper_last_state)
+                self._performance_emit(
+                    process_role="main",
+                    event_type="stage_timing",
+                    stage="evaluation",
+                    phase="end",
+                    cpu_wall_ms=(perf_counter_ns() - evaluation_start_ns) / 1_000_000.0,
+                )
+            else:
+                self.evaluate(stream, gaussian_mapper_last_state=gaussian_mapper_last_state)
             self.info("Evaluation complete", logger=log)
 
         for i, p in enumerate(processes):
@@ -1107,6 +1270,20 @@ class SLAM:
 
         start_time = perf_counter()
         self.info(str(start_time), logger=log)
+        if self.performance_monitor_enabled:
+            online_slam_start_ns = perf_counter_ns()
+            self._performance_emit(
+                process_role="main",
+                event_type="process_lifecycle",
+                stage="process",
+                phase="begin",
+            )
+            self._performance_emit(
+                process_role="main",
+                event_type="stage_timing",
+                stage="online_slam",
+                phase="begin",
+            )
 
         # Wait for all processes to have finished before terminating and for final mapping update to be transmitted
         if self.cfg.run_mapping:
@@ -1145,5 +1322,21 @@ class SLAM:
         if (end_time - start_time) > 1e-10:
             self.info("Total FPS: {:.2f}".format(len(stream) / (end_time - start_time)), logger=log)
         self.info("##########", logger=log)
+        if self.performance_monitor_enabled:
+            self._performance_emit(
+                process_role="main",
+                event_type="stage_timing",
+                stage="online_slam",
+                phase="end",
+                cpu_wall_ms=(perf_counter_ns() - online_slam_start_ns) / 1_000_000.0,
+                frame_count=len(stream),
+            )
 
         self.terminate(processes, stream, gaussian_mapper_last_state)
+        if self.performance_monitor_enabled:
+            self._performance_emit(
+                process_role="main",
+                event_type="process_lifecycle",
+                stage="process",
+                phase="end",
+            )
