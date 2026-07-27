@@ -40,6 +40,7 @@ _CUDA_STAGE_NAMES = (
     "optimizer_step",
     "zero_grad_housekeeping",
 )
+_UPDATE_KINDS = ("online", "tail", "final")
 
 
 def _utc_now() -> str:
@@ -101,6 +102,7 @@ class MappingActivityObserver:
         self._iteration_events_emitted = 0
         self._active_update: Optional[Dict[str, Any]] = None
         self._finalized = False
+        self._finalize_event: Optional[Dict[str, Any]] = None
         self._observer_errors: List[Dict[str, Any]] = []
 
     @property
@@ -187,6 +189,7 @@ class MappingActivityObserver:
             "timestamp_utc": _utc_now(),
             "pid": os.getpid(),
             "process_role": "mapper",
+            "cuda_device": str(self.device),
             "update_id": int(update_id) if update_id is not None else None,
             "iteration_id": (
                 int(iteration_id) if iteration_id is not None else None
@@ -218,6 +221,26 @@ class MappingActivityObserver:
     ) -> None:
         if self._active_update is not None:
             raise RuntimeError("Mapping activity update is already active.")
+        if update_kind not in _UPDATE_KINDS:
+            raise ValueError(
+                f"Unsupported mapping activity update kind: {update_kind!r}."
+            )
+
+        cuda_stream = None
+        if self.cuda_available:
+            current_device = torch.cuda.current_device()
+            expected_device = (
+                current_device
+                if self.device.index is None
+                else self.device.index
+            )
+            if current_device != expected_device:
+                raise RuntimeError(
+                    "Mapping activity CUDA device mismatch: "
+                    f"configured={self.device}, current=cuda:{current_device}."
+                )
+            cuda_stream = torch.cuda.current_stream(device=self.device)
+
         self._active_update = {
             "update_id": int(update_id),
             "update_kind": str(update_kind),
@@ -228,13 +251,13 @@ class MappingActivityObserver:
             "pending_cuda_events": [],
             "invariant_failures": [],
             "explicit_observer_sync_count": 0,
+            "cuda_stream": cuda_stream,
         }
 
     def begin_iteration(
         self,
         update_id: int,
         iteration_id: int,
-        gaussian_count: int,
     ) -> Optional[Dict[str, Any]]:
         update = self._require_update(update_id)
         update["iteration_total"] += 1
@@ -252,7 +275,7 @@ class MappingActivityObserver:
                 "camera_uids": [],
                 "sample_every": self.sample_every,
                 "gradient_eps": self.gradient_eps,
-                "global_gaussian_count": int(gaussian_count),
+                "global_gaussian_count": None,
                 "global_gaussian_count_at_backward": None,
                 "global_gaussian_count_after_iteration": None,
                 "visible_count_per_camera": [],
@@ -295,6 +318,8 @@ class MappingActivityObserver:
                 "memory_boundary_aggregation": (
                     "maximum_for_repeated_camera_boundaries"
                 ),
+                "iteration_total_cpu_wall_includes_return_item": True,
+                "iteration_total_cuda_excludes_host_scalar_wait": True,
                 "invariant_failures": [],
                 "_visible_union_mask": None,
                 "_touched_union_mask": None,
@@ -302,11 +327,24 @@ class MappingActivityObserver:
             }
         )
         update["records"].append(record)
-        self.memory_boundary(record, "before_forward")
         record["_iteration_total_token"] = self.begin_stage(
             record, "iteration_total"
         )
         return record
+
+    def set_iteration_global_count(
+        self,
+        record: Optional[Dict[str, Any]],
+        gaussian_count: int,
+    ) -> None:
+        if record is None:
+            return
+        if record["global_gaussian_count"] is not None:
+            raise RuntimeError(
+                "Mapping activity global Gaussian count is already set."
+            )
+        record["global_gaussian_count"] = int(gaussian_count)
+        self.memory_boundary(record, "before_forward")
 
     def _require_update(self, update_id: int) -> Dict[str, Any]:
         if self._active_update is None:
@@ -328,8 +366,13 @@ class MappingActivityObserver:
 
         gpu_start = None
         if self.collect_cuda_timing and self.cuda_available:
+            update = self._active_update
+            if update is None or update["cuda_stream"] is None:
+                raise RuntimeError(
+                    "CUDA stage started without an active CUDA stream."
+                )
             gpu_start = torch.cuda.Event(enable_timing=True)
-            gpu_start.record()
+            gpu_start.record(update["cuda_stream"])
         return {
             "stage": stage,
             "cpu_start_ns": time.perf_counter_ns(),
@@ -349,11 +392,13 @@ class MappingActivityObserver:
         ) / 1_000_000.0
 
         if token["gpu_start"] is not None:
-            gpu_end = torch.cuda.Event(enable_timing=True)
-            gpu_end.record()
             update = self._active_update
-            if update is None:
-                raise RuntimeError("CUDA stage ended without an active update.")
+            if update is None or update["cuda_stream"] is None:
+                raise RuntimeError(
+                    "CUDA stage ended without an active CUDA stream."
+                )
+            gpu_end = torch.cuda.Event(enable_timing=True)
+            gpu_end.record(update["cuda_stream"])
             update["pending_cuda_events"].append(
                 (token["gpu_start"], gpu_end, record, stage)
             )
@@ -611,14 +656,51 @@ class MappingActivityObserver:
         if record is not None:
             record["densify_and_prune_executed"] = bool(executed)
 
-    def end_iteration(
+    def mark_iteration_cuda_end(
         self,
         record: Optional[Dict[str, Any]],
         gaussian_count: int,
     ) -> None:
         if record is None:
             return
+        if record["global_gaussian_count_after_iteration"] is not None:
+            raise RuntimeError(
+                "Mapping activity iteration CUDA boundary is already set."
+            )
         record["global_gaussian_count_after_iteration"] = int(gaussian_count)
+        token = record.get("_iteration_total_token")
+        if token is None:
+            raise RuntimeError(
+                "Mapping activity iteration total token is missing."
+            )
+        if token["gpu_start"] is not None:
+            update = self._active_update
+            if update is None or update["cuda_stream"] is None:
+                raise RuntimeError(
+                    "CUDA iteration ended without an active CUDA stream."
+                )
+            gpu_end = torch.cuda.Event(enable_timing=True)
+            gpu_end.record(update["cuda_stream"])
+            update["pending_cuda_events"].append(
+                (
+                    token["gpu_start"],
+                    gpu_end,
+                    record,
+                    token["stage"],
+                )
+            )
+            token["gpu_start"] = None
+
+    def end_iteration(
+        self,
+        record: Optional[Dict[str, Any]],
+    ) -> None:
+        if record is None:
+            return
+        if record["global_gaussian_count_after_iteration"] is None:
+            raise RuntimeError(
+                "Mapping activity iteration CUDA boundary was not set."
+            )
         token = record.pop("_iteration_total_token", None)
         self.end_stage(record, token)
 
@@ -684,19 +766,21 @@ class MappingActivityObserver:
     def _finish_cuda_work(self, update: Dict[str, Any]) -> None:
         pending = update["pending_cuda_events"]
         has_scalars = self._has_pending_cuda_scalars(update)
-        if pending:
-            pending[-1][1].synchronize()
-            update["explicit_observer_sync_count"] = 1
-            for start, end, record, stage in pending:
-                record["cuda_ms_by_stage"][stage] += float(
-                    start.elapsed_time(end)
-                )
-        elif has_scalars:
-            torch.cuda.synchronize(device=self.device)
-            update["explicit_observer_sync_count"] = 1
+        try:
+            if pending:
+                pending[-1][1].synchronize()
+                update["explicit_observer_sync_count"] = 1
+                for start, end, record, stage in pending:
+                    record["cuda_ms_by_stage"][stage] += float(
+                        start.elapsed_time(end)
+                    )
+            elif has_scalars:
+                torch.cuda.synchronize(device=self.device)
+                update["explicit_observer_sync_count"] = 1
 
-        self._convert_pending_scalars(update)
-        pending.clear()
+            self._convert_pending_scalars(update)
+        finally:
+            pending.clear()
 
     @staticmethod
     def _finalize_iteration_record(record: Dict[str, Any]) -> None:
@@ -822,6 +906,11 @@ class MappingActivityObserver:
             for r in records
             if r["scaling_grad_active_count"] is not None
         ]
+        scaling_ratios = [
+            r["scaling_grad_active_ratio"]
+            for r in records
+            if r["scaling_grad_active_ratio"] is not None
+        ]
 
         memory_maxima = {key: None for key in _MEMORY_FIELDS}
         memory_boundary_maxima: Dict[str, Dict[str, int]] = {}
@@ -873,17 +962,44 @@ class MappingActivityObserver:
                 "visible_union_count_min": _minimum(visible_counts),
                 "visible_union_count_max": _maximum(visible_counts),
                 "visible_union_ratio_mean": _mean(visible_ratios),
+                "visible_union_ratio_min": _minimum(visible_ratios),
+                "visible_union_ratio_max": _maximum(visible_ratios),
                 "touched_union_count_mean": _mean(touched_counts),
+                "touched_union_count_min": _minimum(touched_counts),
+                "touched_union_count_max": _maximum(touched_counts),
                 "touched_union_ratio_mean": _mean(touched_ratios),
+                "touched_union_ratio_min": _minimum(touched_ratios),
+                "touched_union_ratio_max": _maximum(touched_ratios),
                 "gradient_active_any_count_mean": _mean(gradient_counts),
+                "gradient_active_any_count_min": _minimum(gradient_counts),
+                "gradient_active_any_count_max": _maximum(gradient_counts),
                 "gradient_active_any_ratio_mean": _mean(gradient_ratios),
+                "gradient_active_any_ratio_min": _minimum(gradient_ratios),
+                "gradient_active_any_ratio_max": _maximum(gradient_ratios),
                 "gradient_active_render_proxy_count_mean": _mean(
+                    render_gradient_counts
+                ),
+                "gradient_active_render_proxy_count_min": _minimum(
+                    render_gradient_counts
+                ),
+                "gradient_active_render_proxy_count_max": _maximum(
                     render_gradient_counts
                 ),
                 "gradient_active_render_proxy_ratio_mean": _mean(
                     render_gradient_ratios
                 ),
+                "gradient_active_render_proxy_ratio_min": _minimum(
+                    render_gradient_ratios
+                ),
+                "gradient_active_render_proxy_ratio_max": _maximum(
+                    render_gradient_ratios
+                ),
                 "scaling_grad_active_count_mean": _mean(scaling_counts),
+                "scaling_grad_active_count_min": _minimum(scaling_counts),
+                "scaling_grad_active_count_max": _maximum(scaling_counts),
+                "scaling_grad_active_ratio_mean": _mean(scaling_ratios),
+                "scaling_grad_active_ratio_min": _minimum(scaling_ratios),
+                "scaling_grad_active_ratio_max": _maximum(scaling_ratios),
                 "render_forward_cuda_ms_total": self._stage_total(
                     records, "render_forward"
                 ),
@@ -908,6 +1024,12 @@ class MappingActivityObserver:
                 "sampled_iteration_cuda_ms_total": self._stage_total(
                     records, "iteration_total"
                 ),
+                "sampled_iteration_cpu_wall_ms_total": float(
+                    sum(
+                        record["cpu_wall_ms_by_stage"]["iteration_total"]
+                        for record in records
+                    )
+                ),
                 "cpu_wall_ms_totals_by_stage": {
                     stage: float(
                         sum(
@@ -926,6 +1048,9 @@ class MappingActivityObserver:
                 "means_are_sampled_iterations_only": True,
                 "global_count_extrema_are_sampled_iterations_only": True,
                 "memory_maxima_are_sampled_boundaries_only": True,
+                "time_totals_are_sampled_iterations_only": True,
+                "iteration_total_cpu_wall_includes_return_item": True,
+                "iteration_total_cuda_excludes_host_scalar_wait": True,
             }
         )
         return summary
@@ -950,35 +1075,40 @@ class MappingActivityObserver:
         if self._active_update is None:
             raise RuntimeError("No mapping activity update is active.")
         update = self._active_update
-        for record in update["records"]:
-            self.finalize_activity_masks(record)
-        self._finish_cuda_work(update)
-        for record in update["records"]:
-            self._finalize_iteration_record(record)
-            for key in [
-                key for key in record if str(key).startswith("_")
-            ]:
-                record.pop(key, None)
-            if self.log_iteration_events:
-                self._emit(record)
-                self._iteration_events_emitted += 1
+        try:
+            for record in update["records"]:
+                self.finalize_activity_masks(record)
+            self._finish_cuda_work(update)
+            for record in update["records"]:
+                self._finalize_iteration_record(record)
+                for key in [
+                    key for key in record if str(key).startswith("_")
+                ]:
+                    record.pop(key, None)
+                if self.log_iteration_events:
+                    self._emit(record)
+                    self._iteration_events_emitted += 1
 
-        summary = self._build_update_summary(
-            update=update,
-            gaussian_count=gaussian_count,
-            status=status,
-            reason=reason,
-        )
-        if self.log_update_summary:
-            self._emit(summary)
+            summary = self._build_update_summary(
+                update=update,
+                gaussian_count=gaussian_count,
+                status=status,
+                reason=reason,
+            )
+            if self.log_update_summary:
+                self._emit(summary)
 
-        self._updates_completed += 1
-        update["records"].clear()
-        update["pending_cuda_events"].clear()
-        self._active_update = None
-        return summary
+            self._updates_completed += 1
+            return summary
+        finally:
+            update["records"].clear()
+            update["pending_cuda_events"].clear()
+            update["cuda_stream"] = None
+            self._active_update = None
 
     def finalize(self, gaussian_count: int) -> Dict[str, Any]:
+        if self._finalized and self._finalize_event is not None:
+            return self._finalize_event
         if self._active_update is not None:
             self.end_update(
                 gaussian_count=gaussian_count,
@@ -1007,9 +1137,11 @@ class MappingActivityObserver:
                 "pending_cuda_event_count": 0,
                 "observed_scope": "gaussian_mapper_updates_only",
                 "refinement_mapping_steps_observed": False,
+                "final_gaussian_count_stage": "after_optional_refinement",
             }
         )
         self._emit(event)
         self._observer_errors.clear()
         self._finalized = True
+        self._finalize_event = event
         return event

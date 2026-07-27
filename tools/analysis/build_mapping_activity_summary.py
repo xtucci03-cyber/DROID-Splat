@@ -14,7 +14,10 @@ PREFIX = "[MappingActivityObserver]"
 SCHEMA = 1
 ITERATION_EVENT = "iteration_activity"
 UPDATE_EVENT = "update_summary"
-FINAL_EVENT_TYPES = {"finalize_summary", "process_summary"}
+FINAL_EVENT_TYPES = {"finalize_summary"}
+UPDATE_KINDS = ("online", "tail", "final")
+FLOAT_ABS_TOLERANCE = 1e-6
+FLOAT_REL_TOLERANCE = 1e-9
 COMMON_FIELDS = (
     "schema",
     "event_id",
@@ -22,6 +25,7 @@ COMMON_FIELDS = (
     "timestamp_utc",
     "pid",
     "process_role",
+    "cuda_device",
     "update_id",
     "iteration_id",
     "sampled",
@@ -61,20 +65,31 @@ STAGE_NAMES = (
     "optimizer_step",
     "zero_grad_housekeeping",
 )
-SUMMARY_MEAN_FIELDS = {
-    "visible_union_count_mean": "visible_union_count",
-    "visible_union_ratio_mean": "visible_union_ratio",
-    "touched_union_count_mean": "touched_union_count",
-    "touched_union_ratio_mean": "touched_union_ratio",
-    "gradient_active_any_count_mean": "gradient_active_any_count",
-    "gradient_active_any_ratio_mean": "gradient_active_any_ratio",
-    "gradient_active_render_proxy_count_mean": (
-        "gradient_active_render_proxy_count"
-    ),
-    "gradient_active_render_proxy_ratio_mean": (
-        "gradient_active_render_proxy_ratio"
-    ),
-    "scaling_grad_active_count_mean": "scaling_grad_active_count",
+SUMMARY_STAT_FIELDS = {
+    f"{source}_{statistic}": (source, statistic)
+    for source in (
+        "visible_union_count",
+        "visible_union_ratio",
+        "touched_union_count",
+        "touched_union_ratio",
+        "gradient_active_any_count",
+        "gradient_active_any_ratio",
+        "gradient_active_render_proxy_count",
+        "gradient_active_render_proxy_ratio",
+        "scaling_grad_active_count",
+        "scaling_grad_active_ratio",
+    )
+    for statistic in ("mean", "min", "max")
+}
+CUDA_TOTAL_FIELDS = {
+    "render_forward_cuda_ms_total": "render_forward",
+    "loss_cuda_ms_total": "loss_computation",
+    "backward_cuda_ms_total": "backward",
+    "densification_stats_cuda_ms_total": "densification_stats",
+    "densify_and_prune_cuda_ms_total": "densify_and_prune",
+    "optimizer_step_cuda_ms_total": "optimizer_step",
+    "zero_grad_housekeeping_cuda_ms_total": "zero_grad_housekeeping",
+    "sampled_iteration_cuda_ms_total": "iteration_total",
 }
 
 
@@ -84,6 +99,38 @@ class ValidationError(RuntimeError):
 
 def _is_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _numbers_match(observed: Any, expected: Any) -> bool:
+    if observed is None or expected is None:
+        return observed is None and expected is None
+    if (
+        isinstance(observed, bool)
+        or not isinstance(observed, (int, float))
+        or isinstance(expected, bool)
+        or not isinstance(expected, (int, float))
+        or not math.isfinite(float(observed))
+        or not math.isfinite(float(expected))
+    ):
+        return False
+    return math.isclose(
+        float(observed),
+        float(expected),
+        rel_tol=FLOAT_REL_TOLERANCE,
+        abs_tol=FLOAT_ABS_TOLERANCE,
+    )
+
+
+def _statistic(values: Sequence[float], statistic: str) -> Optional[float]:
+    if not values:
+        return None
+    if statistic == "mean":
+        return float(mean(values))
+    if statistic == "min":
+        return float(min(values))
+    if statistic == "max":
+        return float(max(values))
+    raise ValueError(f"Unsupported statistic: {statistic!r}")
 
 
 def _require_keys(
@@ -109,10 +156,16 @@ def extract_events(log_path: Path) -> List[Dict[str, Any]]:
                 marker = line.find(PREFIX, cursor)
                 if marker < 0:
                     break
-                json_start = line.find("{", marker + len(PREFIX))
-                if json_start < 0:
+                marker_end = marker + len(PREFIX)
+                next_marker = line.find(PREFIX, marker_end)
+                json_start = line.find("{", marker_end)
+                if (
+                    json_start < 0
+                    or (next_marker >= 0 and json_start >= next_marker)
+                ):
                     raise ValidationError(
-                        f"line {line_number}: marker has no JSON object"
+                        f"line {line_number}, offset {marker}: "
+                        "marker has no JSON object before the next marker"
                     )
                 try:
                     event, consumed = decoder.raw_decode(line[json_start:])
@@ -149,6 +202,11 @@ def _validate_common(event: Dict[str, Any], location: str) -> List[str]:
         errors.append(f"{location}: event_id must be a non-empty string")
     if event["process_role"] != "mapper":
         errors.append(f"{location}: process_role must be 'mapper'")
+    if (
+        not isinstance(event["cuda_device"], str)
+        or not event["cuda_device"]
+    ):
+        errors.append(f"{location}: cuda_device must be a non-empty string")
     if not _is_int(event["pid"]) or event["pid"] <= 0:
         errors.append(f"{location}: pid must be a positive integer")
     if event["status"] not in {"ok", "error", "skipped"}:
@@ -256,6 +314,8 @@ def _validate_iteration(
         event,
         (
             "camera_uids",
+            "sample_every",
+            "gradient_eps",
             "global_gaussian_count",
             "global_gaussian_count_at_backward",
             "global_gaussian_count_after_iteration",
@@ -277,6 +337,9 @@ def _validate_iteration(
             "cpu_wall_ms_by_stage",
             "cuda_ms_by_stage",
             "memory_snapshots",
+            "densify_and_prune_executed",
+            "iteration_total_cpu_wall_includes_return_item",
+            "iteration_total_cuda_excludes_host_scalar_wait",
             "invariant_failures",
         ),
         location,
@@ -292,6 +355,27 @@ def _validate_iteration(
         errors.append(f"{location}: iteration event must be sampled")
     if event["status"] != "ok":
         errors.append(f"{location}: iteration status is not ok")
+    if not _is_int(event["sample_every"]) or event["sample_every"] < 1:
+        errors.append(f"{location}: sample_every must be an integer >= 1")
+    if (
+        isinstance(event["gradient_eps"], bool)
+        or not isinstance(event["gradient_eps"], (int, float))
+        or not math.isfinite(float(event["gradient_eps"]))
+        or event["gradient_eps"] < 0
+    ):
+        errors.append(
+            f"{location}: gradient_eps must be a finite number >= 0"
+        )
+    if not isinstance(event["densify_and_prune_executed"], bool):
+        errors.append(
+            f"{location}: densify_and_prune_executed must be boolean"
+        )
+    for key in (
+        "iteration_total_cpu_wall_includes_return_item",
+        "iteration_total_cuda_excludes_host_scalar_wait",
+    ):
+        if event[key] is not True:
+            errors.append(f"{location}: {key} must be true")
 
     n_gaussians = event["global_gaussian_count"]
     if not _is_int(n_gaussians) or n_gaussians < 0:
@@ -469,7 +553,15 @@ def _validate_update(
             "invariant_failures",
             "memory_maxima",
             "memory_boundary_maxima",
-            *SUMMARY_MEAN_FIELDS.keys(),
+            "cpu_wall_ms_totals_by_stage",
+            "sampled_iteration_cpu_wall_ms_total",
+            "means_are_sampled_iterations_only",
+            "global_count_extrema_are_sampled_iterations_only",
+            "time_totals_are_sampled_iterations_only",
+            "iteration_total_cpu_wall_includes_return_item",
+            "iteration_total_cuda_excludes_host_scalar_wait",
+            *CUDA_TOTAL_FIELDS.keys(),
+            *SUMMARY_STAT_FIELDS.keys(),
         ),
         location,
     )
@@ -481,6 +573,10 @@ def _validate_update(
         errors.append(f"{location}: update summary iteration_id must be null")
     if event["sampled"] is not False:
         errors.append(f"{location}: update summary sampled must be false")
+    if event["update_kind"] not in UPDATE_KINDS:
+        errors.append(
+            f"{location}: invalid update_kind {event['update_kind']!r}"
+        )
     if event["status"] == "error":
         errors.append(f"{location}: update summary status is error")
     elif event["status"] == "skipped" and not event["reason"]:
@@ -557,6 +653,29 @@ def _validate_update(
             errors.extend(
                 _validate_nonnegative_tree(value, location, key)
             )
+    errors.extend(
+        _validate_nonnegative_tree(
+            event["cpu_wall_ms_totals_by_stage"],
+            location,
+            "cpu_wall_ms_totals_by_stage",
+        )
+    )
+    errors.extend(
+        _validate_nonnegative_tree(
+            event["sampled_iteration_cpu_wall_ms_total"],
+            location,
+            "sampled_iteration_cpu_wall_ms_total",
+        )
+    )
+    for key in (
+        "means_are_sampled_iterations_only",
+        "global_count_extrema_are_sampled_iterations_only",
+        "time_totals_are_sampled_iterations_only",
+        "iteration_total_cpu_wall_includes_return_item",
+        "iteration_total_cuda_excludes_host_scalar_wait",
+    ):
+        if event[key] is not True:
+            errors.append(f"{location}: {key} must be true")
     return errors
 
 
@@ -572,6 +691,9 @@ def _validate_finalize(
             "observer_errors",
             "pending_update",
             "pending_cuda_event_count",
+            "observed_scope",
+            "refinement_mapping_steps_observed",
+            "final_gaussian_count_stage",
         ),
         location,
     )
@@ -599,6 +721,16 @@ def _validate_finalize(
         errors.append(f"{location}: observer_errors must be a list")
     elif event["observer_errors"]:
         errors.append(f"{location}: observer_errors is not empty")
+    if event["observed_scope"] != "gaussian_mapper_updates_only":
+        errors.append(f"{location}: invalid observed_scope")
+    if event["refinement_mapping_steps_observed"] is not False:
+        errors.append(
+            f"{location}: refinement_mapping_steps_observed must be false"
+        )
+    if event["final_gaussian_count_stage"] != "after_optional_refinement":
+        errors.append(
+            f"{location}: invalid final_gaussian_count_stage"
+        )
     return errors
 
 
@@ -607,8 +739,13 @@ def validate_events(events: Sequence[Dict[str, Any]]) -> None:
     event_ids = set()
     iteration_keys = set()
     update_summaries: Dict[int, Dict[str, Any]] = {}
+    update_summary_order: List[int] = []
     iterations_by_update: Dict[int, List[Dict[str, Any]]] = {}
     finalize_events: List[Dict[str, Any]] = []
+    expected_pid: Optional[int] = None
+    finalize_seen = False
+    open_update_id: Optional[int] = None
+    next_update_id = 0
 
     for index, event in enumerate(events):
         location = (
@@ -618,6 +755,21 @@ def validate_events(events: Sequence[Dict[str, Any]]) -> None:
         errors.extend(common_errors)
         if any(key not in event for key in COMMON_FIELDS):
             continue
+        pid = event.get("pid")
+        if _is_int(pid):
+            if expected_pid is None:
+                expected_pid = pid
+            elif pid != expected_pid:
+                errors.append(
+                    f"{location}: mixed mapper pid observed={pid}, "
+                    f"expected={expected_pid}"
+                )
+
+        if finalize_seen:
+            errors.append(
+                f"{location}: observer event appears after finalize_summary"
+            )
+
         event_id = event.get("event_id")
         if event_id in event_ids:
             errors.append(f"{location}: duplicate event_id {event_id!r}")
@@ -631,9 +783,25 @@ def validate_events(events: Sequence[Dict[str, Any]]) -> None:
                 errors.append(f"{location}: duplicate iteration event {key}")
             iteration_keys.add(key)
             if _is_int(event.get("update_id")):
-                iterations_by_update.setdefault(
-                    event["update_id"], []
-                ).append(event)
+                update_id = event["update_id"]
+                if update_id != next_update_id:
+                    errors.append(
+                        f"{location}: update order observed={update_id}, "
+                        f"expected={next_update_id}"
+                    )
+                if open_update_id is None:
+                    open_update_id = update_id
+                elif open_update_id != update_id:
+                    errors.append(
+                        f"{location}: interleaved update observed={update_id}, "
+                        f"open={open_update_id}"
+                    )
+                if update_id in update_summaries:
+                    errors.append(
+                        f"{location}: iteration for update "
+                        f"{update_id} appears after its update_summary"
+                    )
+                iterations_by_update.setdefault(update_id, []).append(event)
         elif event_type == UPDATE_EVENT:
             errors.extend(_validate_update(event, location))
             update_id = event.get("update_id")
@@ -642,10 +810,45 @@ def validate_events(events: Sequence[Dict[str, Any]]) -> None:
                     f"{location}: duplicate update summary {update_id}"
                 )
             elif _is_int(update_id):
+                if update_id != next_update_id:
+                    errors.append(
+                        f"{location}: update order observed={update_id}, "
+                        f"expected={next_update_id}"
+                    )
+                if (
+                    open_update_id is not None
+                    and open_update_id != update_id
+                ):
+                    errors.append(
+                        f"{location}: update summary observed={update_id}, "
+                        f"open={open_update_id}"
+                    )
+                if (
+                    open_update_id is None
+                    and event.get("status") != "skipped"
+                ):
+                    errors.append(
+                        f"{location}: non-skipped update {update_id} has no "
+                        "preceding iteration events"
+                    )
                 update_summaries[update_id] = event
+                update_summary_order.append(update_id)
+                open_update_id = None
+                next_update_id = update_id + 1
         elif event_type in FINAL_EVENT_TYPES:
             errors.extend(_validate_finalize(event, location))
+            if open_update_id is not None:
+                errors.append(
+                    f"{location}: finalize_summary appears before the update "
+                    f"summary for open update {open_update_id}"
+                )
             finalize_events.append(event)
+            finalize_seen = True
+            if index != len(events) - 1:
+                errors.append(
+                    f"{location}: finalize_summary must be the last "
+                    "observer lifecycle event"
+                )
         else:
             errors.append(
                 f"{location}: unsupported event_type {event_type!r}"
@@ -653,7 +856,13 @@ def validate_events(events: Sequence[Dict[str, Any]]) -> None:
 
     if len(finalize_events) != 1:
         errors.append(
-            f"expected exactly one finalize/process summary, found {len(finalize_events)}"
+            f"expected exactly one finalize_summary, found {len(finalize_events)}"
+        )
+
+    if not update_summaries:
+        # GaussianMapper always performs its final _update() before finalize().
+        errors.append(
+            "formal mapper activity run must contain at least one update_summary"
         )
 
     all_update_ids = set(iterations_by_update) | set(update_summaries)
@@ -667,18 +876,38 @@ def validate_events(events: Sequence[Dict[str, Any]]) -> None:
         )
         if expected != actual:
             errors.append(
-                f"update {update_id}: sampled count mismatch "
-                f"summary={expected}, events={actual}"
+                f"update {update_id}: sampled_iteration_count observed="
+                f"{expected!r}, expected={actual!r}"
             )
         summary_event = update_summaries[update_id]
+        if (
+            summary_event.get("status") == "ok"
+            and summary_event.get("iteration_total") == 0
+        ):
+            errors.append(
+                f"update {update_id}: ok update must contain iterations"
+            )
+        if (
+            summary_event.get("status") == "ok"
+            and _is_int(summary_event.get("iteration_total"))
+            and _is_int(summary_event.get("configured_iteration_total"))
+            and summary_event["iteration_total"]
+            != summary_event["configured_iteration_total"]
+        ):
+            errors.append(
+                f"update {update_id}: iteration_total observed="
+                f"{summary_event['iteration_total']!r}, expected="
+                f"{summary_event['configured_iteration_total']!r} from "
+                "configured_iteration_total"
+            )
         if (
             _is_int(summary_event.get("iteration_total"))
             and _is_int(summary_event.get("sample_every"))
         ):
-            actual_ids = sorted(
+            actual_ids = [
                 event["iteration_id"]
                 for event in iterations_by_update.get(update_id, [])
-            )
+            ]
             expected_ids = list(
                 range(
                     0,
@@ -688,10 +917,32 @@ def validate_events(events: Sequence[Dict[str, Any]]) -> None:
             )
             if actual_ids != expected_ids:
                 errors.append(
-                    f"update {update_id}: sampled iteration IDs do not "
-                    f"match sample_every={summary_event['sample_every']}"
+                    f"update {update_id}: sampled iteration IDs observed="
+                    f"{actual_ids!r}, expected={expected_ids!r} for "
+                    f"sample_every={summary_event['sample_every']}"
                 )
         update_iterations = iterations_by_update.get(update_id, [])
+        for iteration in update_iterations:
+            if iteration.get("sample_every") != summary_event.get(
+                "sample_every"
+            ):
+                errors.append(
+                    f"update {update_id}: iteration "
+                    f"{iteration.get('iteration_id')} sample_every observed="
+                    f"{iteration.get('sample_every')}, expected="
+                    f"{summary_event.get('sample_every')}"
+                )
+            if not _numbers_match(
+                iteration.get("gradient_eps"),
+                summary_event.get("gradient_eps"),
+            ):
+                errors.append(
+                    f"update {update_id}: iteration "
+                    f"{iteration.get('iteration_id')} gradient_eps observed="
+                    f"{iteration.get('gradient_eps')}, expected="
+                    f"{summary_event.get('gradient_eps')}"
+                )
+
         sampled_globals = [
             event["global_gaussian_count"]
             for event in update_iterations
@@ -701,36 +952,118 @@ def validate_events(events: Sequence[Dict[str, Any]]) -> None:
         expected_max = max(sampled_globals) if sampled_globals else None
         if summary_event.get("global_count_min") != expected_min:
             errors.append(
-                f"update {update_id}: global_count_min does not match "
-                "sampled iteration events"
+                f"update {update_id}: global_count_min observed="
+                f"{summary_event.get('global_count_min')!r}, "
+                f"expected={expected_min!r}"
             )
         if summary_event.get("global_count_max") != expected_max:
             errors.append(
-                f"update {update_id}: global_count_max does not match "
-                "sampled iteration events"
+                f"update {update_id}: global_count_max observed="
+                f"{summary_event.get('global_count_max')!r}, "
+                f"expected={expected_max!r}"
             )
-        for summary_key, iteration_key in SUMMARY_MEAN_FIELDS.items():
+
+        for summary_key, (
+            iteration_key,
+            statistic,
+        ) in SUMMARY_STAT_FIELDS.items():
             values = [
                 float(event[iteration_key])
                 for event in update_iterations
                 if isinstance(event.get(iteration_key), (int, float))
                 and not isinstance(event.get(iteration_key), bool)
             ]
-            expected_mean = mean(values) if values else None
-            actual_mean = summary_event.get(summary_key)
-            if expected_mean is None:
-                matches = actual_mean is None
-            else:
-                matches = (
-                    isinstance(actual_mean, (int, float))
-                    and not isinstance(actual_mean, bool)
-                    and math.isfinite(float(actual_mean))
-                    and abs(float(actual_mean) - expected_mean) <= 1e-9
-                )
-            if not matches:
+            expected_statistic = _statistic(values, statistic)
+            observed_statistic = summary_event.get(summary_key)
+            if not _numbers_match(
+                observed_statistic,
+                expected_statistic,
+            ):
                 errors.append(
-                    f"update {update_id}: {summary_key} does not match "
-                    f"sampled {iteration_key}"
+                    f"update {update_id}: {summary_key} observed="
+                    f"{observed_statistic!r}, expected="
+                    f"{expected_statistic!r}"
+                )
+
+        cpu_totals = summary_event.get("cpu_wall_ms_totals_by_stage")
+        if isinstance(cpu_totals, dict):
+            for stage in STAGE_NAMES:
+                if stage not in cpu_totals:
+                    errors.append(
+                        f"update {update_id}: "
+                        f"cpu_wall_ms_totals_by_stage missing {stage!r}"
+                    )
+                    continue
+                cpu_stage_values = []
+                for iteration in update_iterations:
+                    timing = iteration.get("cpu_wall_ms_by_stage")
+                    if not isinstance(timing, dict) or stage not in timing:
+                        cpu_stage_values = []
+                        break
+                    cpu_stage_values.append(timing[stage])
+                if len(cpu_stage_values) != len(update_iterations):
+                    continue
+                expected_cpu = float(sum(cpu_stage_values))
+                observed_cpu = cpu_totals[stage]
+                if not _numbers_match(observed_cpu, expected_cpu):
+                    errors.append(
+                        f"update {update_id}: "
+                        f"cpu_wall_ms_totals_by_stage.{stage} observed="
+                        f"{observed_cpu!r}, expected={expected_cpu!r}"
+                    )
+
+        iteration_cpu_values = []
+        for iteration in update_iterations:
+            timing = iteration.get("cpu_wall_ms_by_stage")
+            if not isinstance(timing, dict) or "iteration_total" not in timing:
+                iteration_cpu_values = []
+                break
+            iteration_cpu_values.append(timing["iteration_total"])
+        if len(iteration_cpu_values) == len(update_iterations):
+            expected_iteration_cpu = float(sum(iteration_cpu_values))
+            observed_iteration_cpu = summary_event.get(
+                "sampled_iteration_cpu_wall_ms_total"
+            )
+            if not _numbers_match(
+                observed_iteration_cpu,
+                expected_iteration_cpu,
+            ):
+                errors.append(
+                    f"update {update_id}: "
+                    "sampled_iteration_cpu_wall_ms_total observed="
+                    f"{observed_iteration_cpu!r}, "
+                    f"expected={expected_iteration_cpu!r}"
+                )
+
+        for summary_key, stage in CUDA_TOTAL_FIELDS.items():
+            stage_values = []
+            for iteration in update_iterations:
+                timing = iteration.get("cuda_ms_by_stage")
+                if not isinstance(timing, dict) or stage not in timing:
+                    stage_values = []
+                    break
+                stage_values.append(timing[stage])
+            if len(stage_values) != len(update_iterations):
+                continue
+            if stage_values and any(
+                value is None for value in stage_values
+            ) and not all(value is None for value in stage_values):
+                errors.append(
+                    f"update {update_id}: sampled CUDA stage {stage!r} "
+                    "mixes null and numeric values"
+                )
+                expected_cuda = None
+            elif not stage_values or all(
+                value is None for value in stage_values
+            ):
+                expected_cuda = None
+            else:
+                expected_cuda = float(sum(stage_values))
+            observed_cuda = summary_event.get(summary_key)
+            if not _numbers_match(observed_cuda, expected_cuda):
+                errors.append(
+                    f"update {update_id}: {summary_key} observed="
+                    f"{observed_cuda!r}, expected={expected_cuda!r}"
                 )
 
     if update_summaries:
@@ -738,6 +1071,11 @@ def validate_events(events: Sequence[Dict[str, Any]]) -> None:
         if update_ids != list(range(len(update_ids))):
             errors.append(
                 f"update IDs are not contiguous from zero: {update_ids}"
+            )
+        if update_summary_order != update_ids:
+            errors.append(
+                "update summaries are not in monotonically increasing "
+                f"update_id order: {update_summary_order}"
             )
 
     if finalize_events:
@@ -791,8 +1129,10 @@ def build_summary(events: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     cuda_totals: Dict[str, float] = {}
     memory_maxima = {key: None for key in MEMORY_FIELDS}
     invariant_failures: List[str] = []
+    update_kind_counts = {kind: 0 for kind in UPDATE_KINDS}
     for update in updates:
         invariant_failures.extend(update["invariant_failures"])
+        update_kind_counts[update["update_kind"]] += 1
         for key, value in update.items():
             if key.endswith("_cuda_ms_total") and value is not None:
                 cuda_totals[key] = cuda_totals.get(key, 0.0) + float(
@@ -812,6 +1152,7 @@ def build_summary(events: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         "validation_pass": True,
         "event_count": len(events),
         "update_count": len(updates),
+        "update_kind_counts": update_kind_counts,
         "sampled_iteration_count": len(iterations),
         "global_gaussian_count": _stats(
             _numeric_values(iterations, "global_gaussian_count")
@@ -855,6 +1196,13 @@ def build_summary(events: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         "invariant_failures": invariant_failures,
         "finalize_complete": True,
         "final_gaussian_count": finalize["final_gaussian_count"],
+        "observed_scope": finalize["observed_scope"],
+        "refinement_mapping_steps_observed": finalize[
+            "refinement_mapping_steps_observed"
+        ],
+        "final_gaussian_count_stage": finalize[
+            "final_gaussian_count_stage"
+        ],
     }
 
 

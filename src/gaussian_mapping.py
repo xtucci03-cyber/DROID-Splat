@@ -1070,9 +1070,6 @@ class GaussianMapper(object):
         if len(self.gaussians) == 0:
             return 0.0
 
-        # NOTE chen: this can happen we have zero depth and an inconvenient pose
-        self.gaussians.check_nans()
-
         activity_context = None
         if (
             self.mapping_activity_observer is not None
@@ -1082,6 +1079,15 @@ class GaussianMapper(object):
                 "begin_iteration",
                 update_id=self.count,
                 iteration_id=iter,
+            )
+
+        # NOTE chen: this can happen we have zero depth and an inconvenient pose
+        self.gaussians.check_nans()
+
+        if activity_context is not None:
+            self._mapping_activity_call(
+                "set_iteration_global_count",
+                activity_context,
                 gaussian_count=len(self.gaussians),
             )
 
@@ -1372,11 +1378,17 @@ class GaussianMapper(object):
 
         if activity_context is not None:
             self._mapping_activity_call(
-                "end_iteration",
+                "mark_iteration_cuda_end",
                 activity_context,
                 gaussian_count=len(self.gaussians),
             )
-        return avg_loss.detach().item()
+        mapping_step_result = avg_loss.detach().item()
+        if activity_context is not None:
+            self._mapping_activity_call(
+                "end_iteration",
+                activity_context,
+            )
+        return mapping_step_result
 
     def covisibility_pruning(
         self, mode: str = "new", last: int = 10, dont_prune_latest: int = 1, visibility_th: int = 2
@@ -1655,7 +1667,13 @@ class GaussianMapper(object):
             )
         )
 
-    def _update(self, delay_to_tracking=True, iters: int = 10, release_cache: bool = False):
+    def _update(
+        self,
+        delay_to_tracking=True,
+        iters: int = 10,
+        release_cache: bool = False,
+        update_kind: str = "online",
+    ):
         """Update our rendered map by:
         i) Pull a filtered update from the sparser SLAM map
         ii) Add new Gaussians based on new views
@@ -1673,7 +1691,7 @@ class GaussianMapper(object):
             self._mapping_activity_call(
                 "begin_update",
                 update_id=self.count,
-                update_kind=("online" if delay_to_tracking else "final"),
+                update_kind=update_kind,
                 configured_iteration_total=iters,
                 gaussian_count=len(self.gaussians),
             )
@@ -1840,13 +1858,19 @@ class GaussianMapper(object):
 
         # Dont update when we get no new frames
         if not the_end and self.last_idx + self.delay < (self.cur_idx + 1) and (self.cur_idx + 1) > self.warmup:
-            self._update(iters=self.mapping_iters)
+            self._update(
+                iters=self.mapping_iters,
+                update_kind="online",
+            )
             self.count += 1  # Count how many times we ran the Renderer
             return False
 
         # We reached the end of the video, but we still have to process some keyframes before last call
         elif the_end and self.last_idx + self.delay < self.cur_idx and (self.cur_idx + 1) > self.warmup:
-            self._update(iters=self.mapping_iters)
+            self._update(
+                iters=self.mapping_iters,
+                update_kind="tail",
+            )
             self.count += 1  # Count how many times we ran the Renderer
             return False
 
@@ -1856,7 +1880,11 @@ class GaussianMapper(object):
             self.update_params.pruning.covisibility.dont_prune_latest = 0
             self.update_params.pruning.covisibility.last = 0
             # Run another call to catch the last batch of keyframes
-            self._update(iters=self.mapping_iters + 10, delay_to_tracking=False)
+            self._update(
+                iters=self.mapping_iters + 10,
+                delay_to_tracking=False,
+                update_kind="final",
+            )
             self.count += 1
 
             if self.performance_monitor_enabled:
