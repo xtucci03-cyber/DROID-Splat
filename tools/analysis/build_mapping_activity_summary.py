@@ -55,6 +55,21 @@ MEMORY_FIELDS = (
     "max_memory_allocated_bytes",
     "max_memory_reserved_bytes",
 )
+MEMORY_SNAPSHOT_FIELDS = (
+    *MEMORY_FIELDS,
+    "cuda_device",
+    "max_fields_are_process_cumulative",
+)
+REQUIRED_MEMORY_BOUNDARIES = (
+    "before_forward",
+    "after_forward",
+    "after_loss",
+    "after_backward",
+    "after_densify_prune",
+    "after_optimizer_step",
+    "after_zero_grad",
+)
+MEMORY_BOUNDARY_AGGREGATION = "maximum_for_repeated_camera_boundaries"
 STAGE_NAMES = (
     "iteration_total",
     "render_forward",
@@ -285,25 +300,287 @@ def _validate_nonnegative_tree(
     return errors
 
 
-def _validate_memory_tree(values: Any, location: str) -> List[str]:
+def _validate_memory_values(
+    values: Any,
+    location: str,
+    *,
+    allow_all_null: bool,
+) -> List[str]:
     errors: List[str] = []
     if not isinstance(values, dict):
         return [f"{location}: memory data must be an object"]
-    for key, child in values.items():
-        if key in MEMORY_FIELDS:
-            if (
-                child is not None
-                and (
-                    isinstance(child, bool)
-                    or not isinstance(child, int)
-                    or child < 0
-                )
-            ):
-                errors.append(
-                    f"{location}: {key} must be a non-negative integer or null"
-                )
-        elif isinstance(child, dict):
-            errors.extend(_validate_memory_tree(child, location))
+
+    errors.extend(_require_keys(values, MEMORY_FIELDS, location))
+    observed = [values.get(key) for key in MEMORY_FIELDS]
+    all_null = all(value is None for value in observed)
+    if all_null and allow_all_null:
+        return errors
+    if any(value is None for value in observed):
+        errors.append(
+            f"{location}: memory fields must be either all integers"
+            + (" or all null" if allow_all_null else "")
+        )
+
+    for key in MEMORY_FIELDS:
+        value = values.get(key)
+        if (
+            value is None
+            or isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < 0
+        ):
+            errors.append(
+                f"{location}: {key} must be a non-negative integer"
+                + (" or null with all memory fields" if allow_all_null else "")
+            )
+
+    if errors:
+        return errors
+
+    allocated = values["memory_allocated_bytes"]
+    reserved = values["memory_reserved_bytes"]
+    max_allocated = values["max_memory_allocated_bytes"]
+    max_reserved = values["max_memory_reserved_bytes"]
+    if allocated > reserved:
+        errors.append(
+            f"{location}: memory_allocated_bytes={allocated} exceeds "
+            f"memory_reserved_bytes={reserved}"
+        )
+    if max_allocated < allocated:
+        errors.append(
+            f"{location}: max_memory_allocated_bytes={max_allocated} is below "
+            f"memory_allocated_bytes={allocated}"
+        )
+    if max_reserved < reserved:
+        errors.append(
+            f"{location}: max_memory_reserved_bytes={max_reserved} is below "
+            f"memory_reserved_bytes={reserved}"
+        )
+    if max_allocated > max_reserved:
+        errors.append(
+            f"{location}: max_memory_allocated_bytes={max_allocated} exceeds "
+            f"max_memory_reserved_bytes={max_reserved}"
+        )
+    return errors
+
+
+def _validate_memory_snapshot(
+    snapshot: Any,
+    location: str,
+    expected_cuda_device: str,
+) -> List[str]:
+    if not isinstance(snapshot, dict):
+        return [f"{location}: memory snapshot must be an object"]
+
+    errors = _require_keys(snapshot, MEMORY_SNAPSHOT_FIELDS, location)
+    errors.extend(
+        _validate_memory_values(
+            snapshot,
+            location,
+            allow_all_null=False,
+        )
+    )
+    if snapshot.get("cuda_device") != expected_cuda_device:
+        errors.append(
+            f"{location}: cuda_device observed={snapshot.get('cuda_device')!r}, "
+            f"expected={expected_cuda_device!r}"
+        )
+    if snapshot.get("max_fields_are_process_cumulative") is not True:
+        errors.append(
+            f"{location}: max_fields_are_process_cumulative must be true"
+        )
+    return errors
+
+
+def _validate_memory_snapshots(
+    snapshots: Any,
+    sample_counts: Any,
+    aggregation: Any,
+    location: str,
+    expected_cuda_device: str,
+) -> List[str]:
+    errors: List[str] = []
+    if not isinstance(snapshots, dict):
+        return [f"{location}: memory_snapshots must be an object"]
+    if not isinstance(sample_counts, dict):
+        return [
+            f"{location}: memory_boundary_sample_count must be an object"
+        ]
+    if aggregation != MEMORY_BOUNDARY_AGGREGATION:
+        errors.append(
+            f"{location}: memory_boundary_aggregation observed={aggregation!r}, "
+            f"expected={MEMORY_BOUNDARY_AGGREGATION!r}"
+        )
+
+    for boundary in REQUIRED_MEMORY_BOUNDARIES:
+        if boundary not in snapshots:
+            errors.append(
+                f"{location}: memory_snapshots missing required boundary "
+                f"{boundary!r}"
+            )
+        if boundary not in sample_counts:
+            errors.append(
+                f"{location}: memory_boundary_sample_count missing required "
+                f"boundary {boundary!r}"
+            )
+
+    for boundary, snapshot in snapshots.items():
+        boundary_location = f"{location}: memory boundary {boundary!r}"
+        errors.extend(
+            _validate_memory_snapshot(
+                snapshot,
+                boundary_location,
+                expected_cuda_device,
+            )
+        )
+        count = sample_counts.get(boundary)
+        if not _is_int(count) or count < 1:
+            errors.append(
+                f"{boundary_location}: sample count must be an integer >= 1"
+            )
+
+    for boundary in sample_counts:
+        if boundary not in snapshots:
+            errors.append(
+                f"{location}: memory_boundary_sample_count has boundary "
+                f"{boundary!r} without a snapshot"
+            )
+    return errors
+
+
+def _empty_memory_maxima() -> Dict[str, Optional[int]]:
+    return {key: None for key in MEMORY_FIELDS}
+
+
+def _merge_memory_maxima(
+    maxima: Dict[str, Optional[int]],
+    values: Any,
+) -> None:
+    if not isinstance(values, dict):
+        return
+    for key in MEMORY_FIELDS:
+        value = values.get(key)
+        if not _is_int(value) or value < 0:
+            continue
+        maxima[key] = (
+            value if maxima[key] is None else max(maxima[key], value)
+        )
+
+
+def _recompute_memory_maxima(
+    iterations: Sequence[Dict[str, Any]],
+) -> Tuple[
+    Dict[str, Optional[int]],
+    Dict[str, Dict[str, Optional[int]]],
+]:
+    maxima = _empty_memory_maxima()
+    boundary_maxima: Dict[str, Dict[str, Optional[int]]] = {}
+    for iteration in iterations:
+        snapshots = iteration.get("memory_snapshots")
+        if not isinstance(snapshots, dict):
+            continue
+        for boundary, snapshot in snapshots.items():
+            current = boundary_maxima.setdefault(
+                boundary,
+                _empty_memory_maxima(),
+            )
+            _merge_memory_maxima(current, snapshot)
+            _merge_memory_maxima(maxima, snapshot)
+    return maxima, boundary_maxima
+
+
+def _recompute_run_memory_maxima(
+    updates: Sequence[Dict[str, Any]],
+) -> Tuple[
+    Dict[str, Optional[int]],
+    Dict[str, Dict[str, Optional[int]]],
+]:
+    maxima = _empty_memory_maxima()
+    boundary_maxima: Dict[str, Dict[str, Optional[int]]] = {}
+    for update in updates:
+        _merge_memory_maxima(maxima, update.get("memory_maxima"))
+        update_boundaries = update.get("memory_boundary_maxima")
+        if not isinstance(update_boundaries, dict):
+            continue
+        for boundary, values in update_boundaries.items():
+            current = boundary_maxima.setdefault(
+                boundary,
+                _empty_memory_maxima(),
+            )
+            _merge_memory_maxima(current, values)
+    return maxima, boundary_maxima
+
+
+def _compare_memory_maxima(
+    observed: Any,
+    expected: Dict[str, Optional[int]],
+    *,
+    update_id: int,
+    boundary: str,
+) -> List[str]:
+    errors: List[str] = []
+    if not isinstance(observed, dict):
+        return [
+            f"update {update_id}: boundary={boundary!r} memory maxima "
+            "must be an object"
+        ]
+    for field in MEMORY_FIELDS:
+        observed_value = observed.get(field)
+        expected_value = expected[field]
+        if observed_value != expected_value:
+            errors.append(
+                f"update {update_id}: boundary={boundary!r} field={field!r} "
+                f"observed={observed_value!r}, expected={expected_value!r}"
+            )
+    return errors
+
+
+def _validate_update_memory_conservation(
+    update_id: int,
+    iterations: Sequence[Dict[str, Any]],
+    update: Dict[str, Any],
+) -> List[str]:
+    errors: List[str] = []
+    expected_maxima, expected_boundaries = _recompute_memory_maxima(
+        iterations
+    )
+    errors.extend(
+        _compare_memory_maxima(
+            update.get("memory_maxima"),
+            expected_maxima,
+            update_id=update_id,
+            boundary="<all_sampled_boundaries>",
+        )
+    )
+
+    observed_boundaries = update.get("memory_boundary_maxima")
+    if not isinstance(observed_boundaries, dict):
+        return errors + [
+            f"update {update_id}: memory_boundary_maxima must be an object"
+        ]
+    for boundary in sorted(
+        set(expected_boundaries) | set(observed_boundaries)
+    ):
+        if boundary not in expected_boundaries:
+            errors.append(
+                f"update {update_id}: boundary={boundary!r} appears only in "
+                "online memory_boundary_maxima"
+            )
+            continue
+        if boundary not in observed_boundaries:
+            errors.append(
+                f"update {update_id}: boundary={boundary!r} missing from "
+                "online memory_boundary_maxima"
+            )
+            continue
+        errors.extend(
+            _compare_memory_maxima(
+                observed_boundaries[boundary],
+                expected_boundaries[boundary],
+                update_id=update_id,
+                boundary=boundary,
+            )
+        )
     return errors
 
 
@@ -337,6 +614,8 @@ def _validate_iteration(
             "cpu_wall_ms_by_stage",
             "cuda_ms_by_stage",
             "memory_snapshots",
+            "memory_boundary_sample_count",
+            "memory_boundary_aggregation",
             "densify_and_prune_executed",
             "iteration_total_cpu_wall_includes_return_item",
             "iteration_total_cuda_excludes_host_scalar_wait",
@@ -529,7 +808,15 @@ def _validate_iteration(
             "cuda_ms_by_stage",
         )
     )
-    errors.extend(_validate_memory_tree(event["memory_snapshots"], location))
+    errors.extend(
+        _validate_memory_snapshots(
+            event["memory_snapshots"],
+            event["memory_boundary_sample_count"],
+            event["memory_boundary_aggregation"],
+            location,
+            event["cuda_device"],
+        )
+    )
     return errors
 
 
@@ -553,6 +840,7 @@ def _validate_update(
             "invariant_failures",
             "memory_maxima",
             "memory_boundary_maxima",
+            "memory_maxima_are_sampled_boundaries_only",
             "cpu_wall_ms_totals_by_stage",
             "sampled_iteration_cpu_wall_ms_total",
             "means_are_sampled_iterations_only",
@@ -644,10 +932,32 @@ def _validate_update(
             f"{location}: update reported invariant failures: "
             f"{event['invariant_failures']}"
         )
-    errors.extend(_validate_memory_tree(event["memory_maxima"], location))
     errors.extend(
-        _validate_memory_tree(event["memory_boundary_maxima"], location)
+        _validate_memory_values(
+            event["memory_maxima"],
+            f"{location}: memory_maxima",
+            allow_all_null=True,
+        )
     )
+    memory_boundary_maxima = event["memory_boundary_maxima"]
+    if not isinstance(memory_boundary_maxima, dict):
+        errors.append(
+            f"{location}: memory_boundary_maxima must be an object"
+        )
+    else:
+        for boundary, maxima in memory_boundary_maxima.items():
+            errors.extend(
+                _validate_memory_values(
+                    maxima,
+                    f"{location}: memory boundary maximum {boundary!r}",
+                    allow_all_null=False,
+                )
+            )
+    if event["memory_maxima_are_sampled_boundaries_only"] is not True:
+        errors.append(
+            f"{location}: "
+            "memory_maxima_are_sampled_boundaries_only must be true"
+        )
     for key, value in event.items():
         if key.endswith("_cuda_ms_total") and value is not None:
             errors.extend(
@@ -743,6 +1053,8 @@ def validate_events(events: Sequence[Dict[str, Any]]) -> None:
     iterations_by_update: Dict[int, List[Dict[str, Any]]] = {}
     finalize_events: List[Dict[str, Any]] = []
     expected_pid: Optional[int] = None
+    expected_cuda_device: Optional[str] = None
+    expected_sample_every: Optional[int] = None
     finalize_seen = False
     open_update_id: Optional[int] = None
     next_update_id = 0
@@ -763,6 +1075,27 @@ def validate_events(events: Sequence[Dict[str, Any]]) -> None:
                 errors.append(
                     f"{location}: mixed mapper pid observed={pid}, "
                     f"expected={expected_pid}"
+                )
+        cuda_device = event.get("cuda_device")
+        if isinstance(cuda_device, str) and cuda_device:
+            if expected_cuda_device is None:
+                expected_cuda_device = cuda_device
+            elif cuda_device != expected_cuda_device:
+                errors.append(
+                    f"{location}: mixed cuda_device observed={cuda_device!r}, "
+                    f"expected={expected_cuda_device!r}"
+                )
+
+        sample_every = event.get("sample_every")
+        if event.get("event_type") in {ITERATION_EVENT, UPDATE_EVENT} and _is_int(
+            sample_every
+        ):
+            if expected_sample_every is None:
+                expected_sample_every = sample_every
+            elif sample_every != expected_sample_every:
+                errors.append(
+                    f"{location}: mixed sample_every observed={sample_every}, "
+                    f"expected={expected_sample_every}"
                 )
 
         if finalize_seen:
@@ -1066,6 +1399,14 @@ def validate_events(events: Sequence[Dict[str, Any]]) -> None:
                     f"{observed_cuda!r}, expected={expected_cuda!r}"
                 )
 
+        errors.extend(
+            _validate_update_memory_conservation(
+                update_id,
+                update_iterations,
+                summary_event,
+            )
+        )
+
     if update_summaries:
         update_ids = sorted(update_summaries)
         if update_ids != list(range(len(update_ids))):
@@ -1127,7 +1468,9 @@ def build_summary(events: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     ][0]
 
     cuda_totals: Dict[str, float] = {}
-    memory_maxima = {key: None for key in MEMORY_FIELDS}
+    memory_maxima, memory_boundary_maxima = _recompute_run_memory_maxima(
+        updates
+    )
     invariant_failures: List[str] = []
     update_kind_counts = {kind: 0 for kind in UPDATE_KINDS}
     for update in updates:
@@ -1138,18 +1481,39 @@ def build_summary(events: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
                 cuda_totals[key] = cuda_totals.get(key, 0.0) + float(
                     value
                 )
-        for key in MEMORY_FIELDS:
-            value = update["memory_maxima"].get(key)
-            if value is not None:
-                memory_maxima[key] = (
-                    int(value)
-                    if memory_maxima[key] is None
-                    else max(memory_maxima[key], int(value))
-                )
 
     return {
         "schema": SCHEMA,
         "validation_pass": True,
+        "process": {
+            "pid": events[0]["pid"],
+            "process_role": events[0]["process_role"],
+            "cuda_device": events[0]["cuda_device"],
+        },
+        "sampling_scope": {
+            "sample_every": updates[0]["sample_every"],
+            "statistics_are_sampled_iterations_only": True,
+            "sampled_iteration_count": len(iterations),
+            "configured_iteration_count_total": sum(
+                update["configured_iteration_total"] for update in updates
+            ),
+            "observed_update_count": len(updates),
+        },
+        "memory_scope": {
+            "memory_snapshots_are_sampled_boundaries_only": True,
+            "max_fields_are_process_cumulative": True,
+            "allocated_fields_are_boundary_snapshots": True,
+            "reserved_fields_include_allocator_cache": True,
+        },
+        "refinement_scope": {
+            "observed_scope": finalize["observed_scope"],
+            "refinement_mapping_steps_observed": finalize[
+                "refinement_mapping_steps_observed"
+            ],
+            "final_gaussian_count_stage": finalize[
+                "final_gaussian_count_stage"
+            ],
+        },
         "event_count": len(events),
         "update_count": len(updates),
         "update_kind_counts": update_kind_counts,
@@ -1189,6 +1553,11 @@ def build_summary(events: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
             _numeric_values(iterations, "scaling_grad_active_count")
         ),
         "cuda_time_totals_ms": cuda_totals,
+        "sampled_boundary_memory_maxima_bytes": memory_maxima,
+        "sampled_boundary_memory_maxima_by_boundary_bytes": (
+            memory_boundary_maxima
+        ),
+        # Backward-compatible alias. Its precise scope is documented above.
         "memory_maxima_bytes": memory_maxima,
         "explicit_observer_sync_count_total": sum(
             update["explicit_observer_sync_count"] for update in updates
@@ -1204,6 +1573,73 @@ def build_summary(events: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
             "final_gaussian_count_stage"
         ],
     }
+
+
+def validate_built_summary(
+    events: Sequence[Dict[str, Any]],
+    summary: Dict[str, Any],
+) -> None:
+    iterations = [
+        event for event in events if event["event_type"] == ITERATION_EVENT
+    ]
+    updates = [
+        event for event in events if event["event_type"] == UPDATE_EVENT
+    ]
+    finalize = [
+        event
+        for event in events
+        if event["event_type"] in FINAL_EVENT_TYPES
+    ][0]
+    expected_memory, expected_boundaries = _recompute_run_memory_maxima(
+        updates
+    )
+    expected = {
+        "validation_pass": True,
+        "process": {
+            "pid": events[0]["pid"],
+            "process_role": events[0]["process_role"],
+            "cuda_device": events[0]["cuda_device"],
+        },
+        "sampling_scope": {
+            "sample_every": updates[0]["sample_every"],
+            "statistics_are_sampled_iterations_only": True,
+            "sampled_iteration_count": len(iterations),
+            "configured_iteration_count_total": sum(
+                update["configured_iteration_total"] for update in updates
+            ),
+            "observed_update_count": len(updates),
+        },
+        "memory_scope": {
+            "memory_snapshots_are_sampled_boundaries_only": True,
+            "max_fields_are_process_cumulative": True,
+            "allocated_fields_are_boundary_snapshots": True,
+            "reserved_fields_include_allocator_cache": True,
+        },
+        "refinement_scope": {
+            "observed_scope": finalize["observed_scope"],
+            "refinement_mapping_steps_observed": finalize[
+                "refinement_mapping_steps_observed"
+            ],
+            "final_gaussian_count_stage": finalize[
+                "final_gaussian_count_stage"
+            ],
+        },
+        "sampled_boundary_memory_maxima_bytes": expected_memory,
+        "sampled_boundary_memory_maxima_by_boundary_bytes": (
+            expected_boundaries
+        ),
+        "memory_maxima_bytes": expected_memory,
+    }
+    errors = []
+    for key, expected_value in expected.items():
+        observed_value = summary.get(key)
+        if observed_value != expected_value:
+            errors.append(
+                f"built summary field={key!r} observed={observed_value!r}, "
+                f"expected={expected_value!r}"
+            )
+    if errors:
+        raise ValidationError("\n".join(errors))
 
 
 def _clean_event(event: Dict[str, Any]) -> Dict[str, Any]:
@@ -1287,6 +1723,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         events = extract_events(args.run_log)
         validate_events(events)
         summary = build_summary(events)
+        validate_built_summary(events, summary)
         write_outputs(
             events=events,
             summary=summary,
