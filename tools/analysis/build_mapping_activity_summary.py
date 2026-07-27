@@ -106,6 +106,16 @@ CUDA_TOTAL_FIELDS = {
     "zero_grad_housekeeping_cuda_ms_total": "zero_grad_housekeeping",
     "sampled_iteration_cuda_ms_total": "iteration_total",
 }
+TIMING_PARENT_STAGE = "sampled_iteration_cuda_ms_total"
+TIMING_CHILD_STAGES = (
+    "render_forward_cuda_ms_total",
+    "loss_cuda_ms_total",
+    "backward_cuda_ms_total",
+    "densification_stats_cuda_ms_total",
+    "densify_and_prune_cuda_ms_total",
+    "optimizer_step_cuda_ms_total",
+    "zero_grad_housekeeping_cuda_ms_total",
+)
 
 
 class ValidationError(RuntimeError):
@@ -146,6 +156,31 @@ def _statistic(values: Sequence[float], statistic: str) -> Optional[float]:
     if statistic == "max":
         return float(max(values))
     raise ValueError(f"Unsupported statistic: {statistic!r}")
+
+
+def _measurement_scope() -> Dict[str, Any]:
+    return {
+        "purpose": "mapping_activity_diagnostic",
+        "diagnostic_only": True,
+        "clean_performance_eligible": False,
+        "observer_overhead_included": True,
+        "must_not_replace_clean_baseline_metrics": True,
+        "recommended_clean_performance_source": (
+            "paired runs with activity observer disabled"
+        ),
+    }
+
+
+def _timing_scope() -> Dict[str, Any]:
+    return {
+        "statistics_are_sampled_iterations_only": True,
+        "parent_stage": TIMING_PARENT_STAGE,
+        "child_stages": list(TIMING_CHILD_STAGES),
+        "child_stages_are_nested_within_parent": True,
+        "parent_and_children_must_not_be_summed": True,
+        "child_stage_sum_is_not_total_runtime": True,
+        "cpu_and_cuda_times_are_distinct_measurements": True,
+    }
 
 
 def _require_keys(
@@ -1505,6 +1540,8 @@ def build_summary(events: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
             "allocated_fields_are_boundary_snapshots": True,
             "reserved_fields_include_allocator_cache": True,
         },
+        "measurement_scope": _measurement_scope(),
+        "timing_scope": _timing_scope(),
         "refinement_scope": {
             "observed_scope": finalize["observed_scope"],
             "refinement_mapping_steps_observed": finalize[
@@ -1575,6 +1612,116 @@ def build_summary(events: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def _validate_fixed_scope(
+    observed: Any,
+    expected: Dict[str, Any],
+    scope_name: str,
+) -> List[str]:
+    if not isinstance(observed, dict):
+        return [f"built summary field={scope_name!r} must be an object"]
+
+    errors = []
+    observed_keys = set(observed)
+    expected_keys = set(expected)
+    for key in sorted(expected_keys - observed_keys):
+        errors.append(
+            f"built summary field={scope_name!r}.{key} is missing"
+        )
+    for key in sorted(observed_keys - expected_keys):
+        errors.append(
+            f"built summary field={scope_name!r}.{key} is unexpected"
+        )
+
+    for key, expected_value in expected.items():
+        if key not in observed:
+            continue
+        observed_value = observed[key]
+        field_name = f"{scope_name}.{key}"
+        if isinstance(expected_value, bool):
+            if (
+                not isinstance(observed_value, bool)
+                or observed_value is not expected_value
+            ):
+                errors.append(
+                    f"built summary field={field_name!r} observed="
+                    f"{observed_value!r}, expected strict boolean "
+                    f"{expected_value!r}"
+                )
+        elif isinstance(expected_value, list):
+            if not isinstance(observed_value, list):
+                errors.append(
+                    f"built summary field={field_name!r} must be a list"
+                )
+            elif observed_value != expected_value:
+                errors.append(
+                    f"built summary field={field_name!r} observed="
+                    f"{observed_value!r}, expected={expected_value!r}"
+                )
+        elif (
+            type(observed_value) is not type(expected_value)
+            or observed_value != expected_value
+        ):
+            errors.append(
+                f"built summary field={field_name!r} observed="
+                f"{observed_value!r}, expected={expected_value!r}"
+            )
+    return errors
+
+
+def _validate_measurement_scope(observed: Any) -> List[str]:
+    return _validate_fixed_scope(
+        observed,
+        _measurement_scope(),
+        "measurement_scope",
+    )
+
+
+def _validate_timing_scope(observed: Any) -> List[str]:
+    errors = _validate_fixed_scope(
+        observed,
+        _timing_scope(),
+        "timing_scope",
+    )
+    if not isinstance(observed, dict):
+        return errors
+
+    parent_stage = observed.get("parent_stage")
+    child_stages = observed.get("child_stages")
+    if isinstance(child_stages, list):
+        child_stages_are_strings = all(
+            isinstance(stage, str) for stage in child_stages
+        )
+        if not child_stages_are_strings:
+            errors.append(
+                "built summary field='timing_scope.child_stages' must "
+                "contain only strings"
+            )
+        if (
+            child_stages_are_strings
+            and len(set(child_stages)) != len(child_stages)
+        ):
+            errors.append(
+                "built summary field='timing_scope.child_stages' contains "
+                "duplicate stages"
+            )
+        unknown_stages = [
+            stage
+            for stage in child_stages
+            if isinstance(stage, str) and stage not in CUDA_TOTAL_FIELDS
+        ]
+        if unknown_stages:
+            errors.append(
+                "built summary field='timing_scope.child_stages' contains "
+                f"unknown stages {unknown_stages!r}"
+            )
+        if parent_stage in child_stages:
+            errors.append(
+                "built summary field='timing_scope.child_stages' must not "
+                "contain parent_stage"
+            )
+    return errors
+
+
 def validate_built_summary(
     events: Sequence[Dict[str, Any]],
     summary: Dict[str, Any],
@@ -1615,6 +1762,8 @@ def validate_built_summary(
             "allocated_fields_are_boundary_snapshots": True,
             "reserved_fields_include_allocator_cache": True,
         },
+        "measurement_scope": _measurement_scope(),
+        "timing_scope": _timing_scope(),
         "refinement_scope": {
             "observed_scope": finalize["observed_scope"],
             "refinement_mapping_steps_observed": finalize[
@@ -1638,6 +1787,10 @@ def validate_built_summary(
                 f"built summary field={key!r} observed={observed_value!r}, "
                 f"expected={expected_value!r}"
             )
+    errors.extend(
+        _validate_measurement_scope(summary.get("measurement_scope"))
+    )
+    errors.extend(_validate_timing_scope(summary.get("timing_scope")))
     if errors:
         raise ValidationError("\n".join(errors))
 
