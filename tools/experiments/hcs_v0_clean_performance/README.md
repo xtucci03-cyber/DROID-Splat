@@ -146,7 +146,8 @@ bash tools/experiments/hcs_v0_clean_performance/019_hcs_v0_budget20_clean_perfor
 每份脚本：
 
 - 拒绝覆盖已有记录目录；
-- 保存 Git、submodule、环境、完整 Hydra config/overrides、UTC 时间；
+- 保存 Git、superproject index gitlink 子模块证据、环境、完整 Hydra
+  config/overrides、UTC 时间；
 - 保存完整 `run.log`；
 - 保存 GPU 整卡采样和 compute-process 采样；
 - 检测运行期间非本次进程树的 GPU compute PID；
@@ -162,6 +163,30 @@ bash tools/experiments/hcs_v0_clean_performance/019_hcs_v0_budget20_clean_perfor
 成功状态只能是 `PASS_NOT_YET_SEALED`；任何运行、Parser、配置、GPU污染、
 评价或守恒门禁失败均为 `FAIL_PRESERVED`。脚本不会写
 `PASS_SEALED`。
+
+## Linked worktree子模块证据口径
+
+服务器实验包使用 linked worktree。协议不执行 `git submodule status`，也不递归
+进入子模块；这样不会因 linked worktree 的子模块管理状态而触发隐式初始化、
+网络访问或超出本实验原子步骤的状态遍历。
+
+两份脚本只从 superproject 的已提交对象和 index 收集证据：
+
+1. 若 `HEAD:.gitmodules` 存在，使用 `git show HEAD:.gitmodules` 原样保存为
+   `gitmodules_snapshot.txt`；不存在时保存空文件；
+2. 使用 `git ls-files --stage` 提取 mode `160000` 的 gitlink，保存其 40 位
+   commit SHA 与路径到 `submodule_gitlinks.txt`；
+3. 由标准库 Python fail-closed 验证文件可读性、gitlink mode、SHA 格式、路径
+   非空且唯一、`.gitmodules` 声明路径均有对应 gitlink，以及每个 gitlink
+   目录在 worktree 中存在；
+4. 将结构化结果写入 `submodule_evidence_validation.json`，并要求
+   `validation_pass=true`、`errors=[]` 后才允许正式后验验收通过。
+
+该口径证明的是 superproject 在本次提交中记录的直接 gitlink 及其工作树目录
+存在性，不证明嵌套子模块的递归 clean 状态，也不替代服务器正式 Python import
+与 CUDA 环境门禁。三个证据文件、`RUN_STATUS.txt`、
+`PERFORMANCE_VALIDATION.json` 和中文摘要都进入最终
+`record_checksums.sha256`。
 
 ## 性能解释边界
 

@@ -94,7 +94,13 @@ stop_monitor() {
 
 preserve_failure() {
     local rc=$?
+    local submodule_validation="false"
     stop_monitor
+    if test -f "$REC/submodule_evidence_validation.json" &&
+        grep -Eq '"validation_pass"[[:space:]]*:[[:space:]]*true' \
+            "$REC/submodule_evidence_validation.json"; then
+        submodule_validation="true"
+    fi
     if test ! -f "$REC/run_end_utc.txt"; then
         date -u '+%Y-%m-%dT%H:%M:%SZ' > "$REC/run_end_utc.txt"
     fi
@@ -106,6 +112,9 @@ preserve_failure() {
             echo "HCS_MODE=deterministic_stratified"
             echo "HISTORY_BUDGET=$HISTORY_BUDGET"
             echo "019_REQUIRES_018_REVIEW_PASS=true"
+            echo "SUBMODULE_EVIDENCE_METHOD=superproject_index_gitlinks_only"
+            echo "RECURSIVE_SUBMODULE_STATUS_USED=false"
+            echo "SUBMODULE_EVIDENCE_VALIDATION_PASS=$submodule_validation"
             echo "STATUS=FAIL_PRESERVED"
             echo "FAILURE_EXIT_CODE=$rc"
         } > "$REC/RUN_STATUS.txt"
@@ -113,6 +122,177 @@ preserve_failure() {
     exit "$rc"
 }
 trap preserve_failure EXIT
+
+collect_submodule_evidence() {
+    local gitmodules_present="false"
+
+    if git -C "$WT" cat-file -e HEAD:.gitmodules 2>/dev/null; then
+        gitmodules_present="true"
+        git -C "$WT" show HEAD:.gitmodules \
+            > "$REC/gitmodules_snapshot.txt"
+    else
+        : > "$REC/gitmodules_snapshot.txt"
+    fi
+
+    git -C "$WT" ls-files --stage |
+        awk '$1 == "160000" {
+            print $1 "\t" $2 "\t" $4
+        }' \
+        > "$REC/submodule_gitlinks.txt"
+
+    "$PY" - "$WT" "$REC" "$gitmodules_present" <<'SUBMODULE_PY'
+from __future__ import annotations
+
+import configparser
+import json
+import re
+import sys
+from collections import Counter
+from pathlib import Path
+
+worktree = Path(sys.argv[1])
+record = Path(sys.argv[2])
+gitmodules_present = sys.argv[3] == "true"
+gitmodules_path = record / "gitmodules_snapshot.txt"
+gitlinks_path = record / "submodule_gitlinks.txt"
+errors: list[str] = []
+
+
+def readable_text(path: Path, label: str) -> str:
+    if not path.is_file():
+        errors.append(f"{label}_MISSING")
+        return ""
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        errors.append(f"{label}_UNREADABLE={type(exc).__name__}")
+        return ""
+
+
+gitmodules_text = readable_text(
+    gitmodules_path,
+    "GITMODULES_SNAPSHOT",
+)
+gitlinks_text = readable_text(
+    gitlinks_path,
+    "SUBMODULE_GITLINKS",
+)
+
+gitmodules_paths: list[str] = []
+if gitmodules_present:
+    parser = configparser.ConfigParser(interpolation=None)
+    try:
+        parser.read_string(gitmodules_text)
+        for section in parser.sections():
+            if not section.startswith("submodule "):
+                errors.append(f"INVALID_GITMODULES_SECTION={section}")
+                continue
+            if not parser.has_option(section, "path"):
+                errors.append(f"GITMODULES_PATH_MISSING={section}")
+                continue
+            path = parser.get(section, "path").strip()
+            if not path:
+                errors.append(f"GITMODULES_PATH_EMPTY={section}")
+                continue
+            gitmodules_paths.append(path)
+    except configparser.Error as exc:
+        errors.append(f"GITMODULES_PARSE_ERROR={type(exc).__name__}")
+elif gitmodules_text:
+    errors.append("GITMODULES_CONTENT_WITHOUT_HEAD_ENTRY")
+
+gitmodule_path_counts = Counter(gitmodules_paths)
+duplicate_gitmodules_paths = sorted(
+    path for path, count in gitmodule_path_counts.items() if count > 1
+)
+if duplicate_gitmodules_paths:
+    errors.append(
+        "DUPLICATE_GITMODULES_PATHS="
+        + ",".join(duplicate_gitmodules_paths)
+    )
+
+gitlink_records: list[dict[str, str]] = []
+malformed_gitlink_lines: list[int] = []
+for line_number, raw_line in enumerate(
+    gitlinks_text.splitlines(),
+    start=1,
+):
+    fields = raw_line.split("\t", 2)
+    if len(fields) != 3:
+        malformed_gitlink_lines.append(line_number)
+        continue
+    mode, sha, path = fields
+    if mode != "160000":
+        errors.append(f"INVALID_GITLINK_MODE_LINE_{line_number}={mode}")
+    if re.fullmatch(r"[0-9a-fA-F]{40}", sha) is None:
+        errors.append(f"INVALID_GITLINK_SHA_LINE_{line_number}={sha}")
+    if not path:
+        errors.append(f"EMPTY_GITLINK_PATH_LINE_{line_number}")
+    gitlink_records.append(
+        {
+            "mode": mode,
+            "sha": sha.lower(),
+            "path": path,
+        }
+    )
+if malformed_gitlink_lines:
+    errors.append(
+        "MALFORMED_GITLINK_LINES="
+        + ",".join(map(str, malformed_gitlink_lines))
+    )
+
+gitlink_paths = [record["path"] for record in gitlink_records]
+gitlink_path_counts = Counter(gitlink_paths)
+duplicate_paths = sorted(
+    path for path, count in gitlink_path_counts.items() if count > 1
+)
+if duplicate_paths:
+    errors.append("DUPLICATE_GITLINK_PATHS=" + ",".join(duplicate_paths))
+
+gitlink_path_set = set(gitlink_paths)
+missing_gitlinks = sorted(set(gitmodules_paths) - gitlink_path_set)
+if missing_gitlinks:
+    errors.append("MISSING_GITLINKS=" + ",".join(missing_gitlinks))
+
+missing_worktree_directories = sorted(
+    path
+    for path in gitlink_paths
+    if not (worktree / path).is_dir()
+)
+if missing_worktree_directories:
+    errors.append(
+        "MISSING_WORKTREE_DIRECTORIES="
+        + ",".join(missing_worktree_directories)
+    )
+
+result = {
+    "validation_pass": not errors,
+    "collection_method": "superproject_index_gitlinks_only",
+    "recursive_submodule_status_used": False,
+    "gitmodules_present": gitmodules_present,
+    "gitmodules_path_count": len(gitmodules_paths),
+    "gitlink_count": len(gitlink_records),
+    "gitmodules_paths": sorted(gitmodules_paths),
+    "gitlink_paths": sorted(gitlink_paths),
+    "gitlink_records": sorted(
+        gitlink_records,
+        key=lambda item: item["path"],
+    ),
+    "missing_gitlinks": missing_gitlinks,
+    "duplicate_paths": duplicate_paths,
+    "duplicate_gitmodules_paths": duplicate_gitmodules_paths,
+    "missing_worktree_directories": missing_worktree_directories,
+    "errors": errors,
+}
+(record / "submodule_evidence_validation.json").write_text(
+    json.dumps(result, ensure_ascii=False, indent=2) + "\n",
+    encoding="utf-8",
+)
+print(json.dumps(result, ensure_ascii=False, indent=2))
+if errors:
+    raise SystemExit(1)
+print("SUBMODULE_EVIDENCE_VALIDATION_PASS")
+SUBMODULE_PY
+}
 
 cp "$SCRIPT_PATH" "$REC/protocol_script.sh"
 cp "$REVIEW_018_GATE" "$REC/018_REVIEW_PASS.txt"
@@ -137,6 +317,8 @@ sha256sum "$REVIEW_018_GATE" > "$REC/018_REVIEW_PASS.sha256"
     echo "HCS_LOGGING=false"
     echo "LIFECYCLE_OBSERVER=false"
     echo "PERFORMANCE_MONITOR=true"
+    echo "SUBMODULE_EVIDENCE_METHOD=superproject_index_gitlinks_only"
+    echo "RECURSIVE_SUBMODULE_STATUS_USED=false"
     echo "MEASUREMENT_SCOPE=PAIRED_CLEAN_ALGORITHM_WITH_PERFORMANCE_MONITOR"
     echo "CLEAN_PAIR_ELIGIBLE=true"
     echo "PASS_SEALED_AUTOMATICALLY=false"
@@ -144,7 +326,7 @@ sha256sum "$REVIEW_018_GATE" > "$REC/018_REVIEW_PASS.sha256"
 
 git -C "$WT" status --short > "$REC/git_status_before.txt"
 git -C "$WT" log -5 --decorate --oneline > "$REC/git_log_before.txt"
-git -C "$WT" submodule status --recursive > "$REC/submodule_status.txt"
+collect_submodule_evidence
 git -C "$WT" remote -v > "$REC/git_remote.txt"
 git -C "$WT" diff --name-status \
     "$ALGORITHM_PARENT_SHA..$EXPERIMENT_PACKAGE_SHA" \
@@ -398,12 +580,52 @@ required_files = [
     "hydra_overrides.yaml",
     "performance_summary.json",
     "resource_monitor.jsonl",
+    "gitmodules_snapshot.txt",
+    "submodule_gitlinks.txt",
+    "submodule_evidence_validation.json",
     "evaluation/odometry/evaluation_results.csv",
     "evaluation/rendering/evaluation_results.csv",
 ]
 for name in required_files:
     if not (rec / name).is_file():
         errors.append(f"MISSING={name}")
+
+submodule_evidence = {}
+submodule_evidence_path = rec / "submodule_evidence_validation.json"
+if submodule_evidence_path.is_file():
+    try:
+        submodule_evidence = json.loads(
+            submodule_evidence_path.read_text(encoding="utf-8")
+        )
+    except (json.JSONDecodeError, OSError) as exc:
+        errors.append(f"SUBMODULE_EVIDENCE_LOAD_FAILED={type(exc).__name__}")
+if not isinstance(submodule_evidence, dict):
+    errors.append("SUBMODULE_EVIDENCE_NOT_OBJECT")
+    submodule_evidence = {}
+
+submodule_evidence_method = submodule_evidence.get("collection_method")
+recursive_submodule_status_used = submodule_evidence.get(
+    "recursive_submodule_status_used"
+)
+submodule_evidence_validation_pass = submodule_evidence.get("validation_pass")
+if submodule_evidence_method != "superproject_index_gitlinks_only":
+    errors.append(
+        f"SUBMODULE_EVIDENCE_METHOD={submodule_evidence_method!r}"
+    )
+if recursive_submodule_status_used is not False:
+    errors.append(
+        "RECURSIVE_SUBMODULE_STATUS_USED="
+        f"{recursive_submodule_status_used!r}"
+    )
+if submodule_evidence_validation_pass is not True:
+    errors.append(
+        "SUBMODULE_EVIDENCE_VALIDATION_PASS="
+        f"{submodule_evidence_validation_pass!r}"
+    )
+if submodule_evidence.get("errors") != []:
+    errors.append(
+        f"SUBMODULE_EVIDENCE_ERRORS={submodule_evidence.get('errors')!r}"
+    )
 
 cfg = None
 if (rec / "hydra_config.yaml").is_file():
@@ -684,6 +906,9 @@ result = {
     "stage_pair_count": validation.get("stage_pair_count"),
     "process_count": validation.get("process_count"),
     "mapper_update_ids": mapper_update_ids,
+    "submodule_evidence_method": submodule_evidence_method,
+    "recursive_submodule_status_used": recursive_submodule_status_used,
+    "submodule_evidence_validation_pass": submodule_evidence_validation_pass,
     "key_metrics": key_metrics,
     "errors": errors,
     "validation_pass": not errors,
@@ -712,6 +937,12 @@ status = "PASS_NOT_YET_SEALED" if not errors else "FAIL_PRESERVED"
             "LIFECYCLE_OBSERVER=false",
             "PERFORMANCE_MONITOR=true",
             "PERFORMANCE_MONITOR_OVERHEAD_INCLUDED=true",
+            "SUBMODULE_EVIDENCE_METHOD=superproject_index_gitlinks_only",
+            "RECURSIVE_SUBMODULE_STATUS_USED=false",
+            (
+                "SUBMODULE_EVIDENCE_VALIDATION_PASS="
+                f"{str(submodule_evidence_validation_pass is True).lower()}"
+            ),
             f"DROID_EXIT={droid_exit}",
             f"PERFORMANCE_PARSER_EXIT={parser_exit}",
             f"EVALUATION_FILE_COUNT={evaluation_file_count}",
@@ -733,6 +964,12 @@ summary_lines = [
     "- 019_REQUIRES_018_REVIEW_PASS：`true`",
     "- Activity/Lifecycle/HCS详细日志：关闭",
     "- Performance Resource Monitor：开启，开销包含在计时中",
+    "- 子模块证据方法：`superproject_index_gitlinks_only`",
+    "- 使用递归 `git submodule status`：`false`",
+    (
+        "- 子模块证据验证："
+        f"`{str(submodule_evidence_validation_pass is True).lower()}`"
+    ),
     f"- DROID退出码：`{droid_exit}`",
     f"- Parser退出码：`{parser_exit}`",
     f"- GPU污染事件：`{len(contamination_rows)}`",
