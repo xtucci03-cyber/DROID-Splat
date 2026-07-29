@@ -7,6 +7,7 @@ does not inspect camera tensors, mapping losses, or Gaussian state.
 from __future__ import annotations
 
 import json
+import hashlib
 import operator
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -15,6 +16,7 @@ from typing import Any, Optional
 
 LOG_PREFIX = "[HistoricalCameraScheduler]"
 SCHEMA_VERSION = 1
+DETERMINISTIC_ALGORITHM = "rotating_stratified_v1"
 SUPPORTED_MODES = frozenset(
     {
         "baseline_random",
@@ -84,6 +86,15 @@ def _same_objects_in_order(left: Sequence[Any], right: Sequence[Any]) -> bool:
         left_item is right_item
         for left_item, right_item in zip(left, right)
     )
+
+
+def _pool_uid_checksum(uids: Sequence[int]) -> str:
+    encoded = json.dumps(
+        list(uids),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -528,7 +539,7 @@ class HistoricalCameraScheduler:
             tick_used,
             effective_budget,
             {
-                "strategy": "deterministic_stratified_v1",
+                "strategy": DETERMINISTIC_ALGORITHM,
                 "base_positions": base_positions,
                 "rotated_positions": rotated_positions,
             },
@@ -651,6 +662,28 @@ class HistoricalCameraScheduler:
         ]
         new_uids = _uids(new)
         frame_uids = _uids(result.frames)
+        is_deterministic = self.mode == "deterministic_stratified"
+        rotation = (
+            result.active_selection_tick
+            if is_deterministic and result.selection_active
+            else None
+        )
+        deterministic_state = {
+            "algorithm": (
+                DETERMINISTIC_ALGORITHM
+                if is_deterministic
+                else None
+            ),
+            "call_key": [
+                result.mapper_update_id,
+                result.mapping_iteration,
+            ],
+            "scheduler_call_count": result.scheduler_call_count,
+            "active_selection_tick": result.active_selection_tick,
+            "base_positions": strategy_details["base_positions"],
+            "rotated_positions": strategy_details["rotated_positions"],
+            "rotation": rotation,
+        }
         event = {
             "schema": SCHEMA_VERSION,
             "event_type": "selection",
@@ -679,6 +712,7 @@ class HistoricalCameraScheduler:
             "n_last_frames": self.n_last_frames,
             "n_rand_frames": self.n_rand_frames,
             "history_budget": self.history_budget,
+            "configured_budget": self.history_budget,
             "effective_history_budget": result.effective_history_budget,
             "preserve_all_history_until": self.preserve_all_history_until,
             "eligible_old_history_count": len(eligible_uids),
@@ -693,6 +727,17 @@ class HistoricalCameraScheduler:
             "protected_new_uids": new_uids,
             "final_selected_count": len(frame_uids),
             "final_selected_uids": frame_uids,
+            "duplicate_uid_count": 0,
+            "invariant_failures": [],
+            "exploitation_uids": [],
+            "exploration_uids": (
+                selected_old_uids
+                if is_deterministic
+                else []
+            ),
+            "starvation_forced_uids": [],
+            "pool_uid_checksum": _pool_uid_checksum(eligible_uids),
+            "deterministic_state": deterministic_state,
             "logging_sample_every": self.logging_sample_every,
             **strategy_details,
         }

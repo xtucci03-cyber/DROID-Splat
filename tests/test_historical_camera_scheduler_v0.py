@@ -473,6 +473,8 @@ class BaselineRandomTests(unittest.TestCase):
         events = parser.extract_events_from_lines(output.getvalue().splitlines())
         parser.validate_events(events)
         self.assertEqual(events[0]["strategy"], "original_select_keyframes")
+        self.assertIsNone(events[0]["deterministic_state"]["algorithm"])
+        self.assertEqual(events[0]["exploration_uids"], [])
 
 
 class LoggingAndParserTests(unittest.TestCase):
@@ -491,6 +493,36 @@ class LoggingAndParserTests(unittest.TestCase):
         events = parser.extract_events_from_lines(text.splitlines())
         return text, events
 
+    def _copy_events(self, events: list[dict]) -> list[dict]:
+        return json.loads(json.dumps(events))
+
+    def _activity_jsonl_for_events(
+        self,
+        events: list[dict],
+        *,
+        mutate_first: bool = False,
+        offset_keys: bool = False,
+    ) -> str:
+        lines = []
+        for index, event in enumerate(events):
+            camera_uids = list(event["final_selected_uids"])
+            if mutate_first and index == 0:
+                camera_uids = list(reversed(camera_uids))
+            update_id = event["mapper_update_id"] + (100 if offset_keys else 0)
+            lines.append(
+                json.dumps(
+                    {
+                        "schema": 1,
+                        "event_type": "iteration_activity",
+                        "update_id": update_id,
+                        "iteration_id": event["mapping_iteration"],
+                        "camera_uids": camera_uids,
+                    },
+                    sort_keys=True,
+                )
+            )
+        return "\n".join(lines) + "\n"
+
     def test_logged_events_parse_and_replay(self) -> None:
         _, events = self._captured_events()
         parser.validate_events(events)
@@ -498,6 +530,28 @@ class LoggingAndParserTests(unittest.TestCase):
         self.assertTrue(summary["validation_pass"])
         self.assertTrue(summary["deterministic_replay_pass"])
         self.assertEqual(summary["event_count"], 3)
+        self.assertEqual(summary["algorithm"], "rotating_stratified_v1")
+        self.assertTrue(summary["pool_checksum_validation_pass"])
+        self.assertFalse(summary["activity_cross_validation_performed"])
+        for event in events:
+            self.assertEqual(event["strategy"], "rotating_stratified_v1")
+            self.assertEqual(event["configured_budget"], event["history_budget"])
+            self.assertEqual(event["duplicate_uid_count"], 0)
+            self.assertEqual(event["invariant_failures"], [])
+            self.assertEqual(event["exploitation_uids"], [])
+            self.assertEqual(event["starvation_forced_uids"], [])
+            self.assertEqual(
+                event["exploration_uids"],
+                event["selected_old_history_uids"],
+            )
+            self.assertEqual(
+                event["deterministic_state"]["algorithm"],
+                "rotating_stratified_v1",
+            )
+            self.assertEqual(
+                event["deterministic_state"]["call_key"],
+                event["call_key"],
+            )
 
     def test_tqdm_prefix_trailing_text_and_multiple_markers(self) -> None:
         text, events = self._captured_events(count=2)
@@ -544,6 +598,121 @@ class LoggingAndParserTests(unittest.TestCase):
         with self.assertRaisesRegex(parser.ValidationError, "base_positions"):
             parser.validate_events(events)
 
+    def test_old_algorithm_name_fails_closed(self) -> None:
+        _, events = self._captured_events(count=1)
+        mutated = self._copy_events(events)
+        mutated[0]["strategy"] = "deterministic_stratified_v1"
+        with self.assertRaisesRegex(parser.ValidationError, "strategy"):
+            parser.validate_events(mutated)
+
+        mutated = self._copy_events(events)
+        mutated[0]["deterministic_state"]["algorithm"] = (
+            "deterministic_stratified_v1"
+        )
+        with self.assertRaisesRegex(parser.ValidationError, "algorithm"):
+            parser.validate_events(mutated)
+
+    def test_pool_checksum_and_deterministic_state_are_required(self) -> None:
+        _, events = self._captured_events(count=1)
+        event = events[0]
+        self.assertTrue(event["pool_uid_checksum"].startswith("sha256:"))
+
+        mutated = self._copy_events(events)
+        mutated[0]["pool_uid_checksum"] = "sha256:bad"
+        with self.assertRaisesRegex(parser.ValidationError, "checksum"):
+            parser.validate_events(mutated)
+
+        mutated = self._copy_events(events)
+        mutated[0]["deterministic_state"]["rotation"] = 999
+        with self.assertRaisesRegex(parser.ValidationError, "rotation"):
+            parser.validate_events(mutated)
+
+    def test_contract_fields_fail_closed_when_inconsistent(self) -> None:
+        _, events = self._captured_events(count=1)
+        cases = (
+            ("duplicate_uid_count", 1, "duplicate_uid_count"),
+            ("invariant_failures", ["bad"], "invariant_failures"),
+            ("exploitation_uids", [1], "exploitation"),
+            ("starvation_forced_uids", [2], "starvation"),
+        )
+        for field, value, pattern in cases:
+            mutated = self._copy_events(events)
+            mutated[0][field] = value
+            with self.subTest(field=field), self.assertRaisesRegex(
+                parser.ValidationError,
+                pattern,
+            ):
+                parser.validate_events(mutated)
+
+        mutated = self._copy_events(events)
+        mutated[0]["exploration_uids"] = []
+        with self.assertRaisesRegex(parser.ValidationError, "exploration"):
+            parser.validate_events(mutated)
+
+    def test_summary_selection_frequency_and_longest_unselected_interval(self) -> None:
+        _, events = self._captured_events(count=3)
+        summary = parser.build_summary(events)
+        self.assertEqual(
+            summary["budget_event_count_by_category"]["partial_budget"],
+            3,
+        )
+        self.assertEqual(summary["eligible_count_by_uid"]["0"], 3)
+        self.assertEqual(summary["old_history_selection_count_by_uid"]["0"], 1)
+        self.assertAlmostEqual(summary["selection_frequency_by_uid"]["0"], 1 / 3)
+        self.assertEqual(
+            summary["longest_unselected_active_interval_by_uid"]["0"],
+            2,
+        )
+        self.assertEqual(summary["max_longest_unselected_active_interval"], 2)
+
+    def test_sampled_logs_mark_selection_gap_scope(self) -> None:
+        instance = scheduler(logging_enabled=True, sample_every=2)
+        output = io.StringIO()
+        with redirect_stdout(output):
+            for iteration in range(5):
+                instance.select(
+                    historical_cameras=cameras(40),
+                    new_cameras=[],
+                    mapper_update_id=0,
+                    mapping_iteration=iteration,
+                )
+        events = parser.extract_events_from_lines(output.getvalue().splitlines())
+        summary = parser.build_summary(events)
+        self.assertEqual(summary["selection_gap_scope"], "sampled_events_only")
+
+    def test_activity_camera_uid_cross_validation_passes_and_fails_closed(self) -> None:
+        _, events = self._captured_events(count=2)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            activity = root / "activity.jsonl"
+            activity.write_text(
+                self._activity_jsonl_for_events(events),
+                encoding="utf-8",
+            )
+            summary = parser.build_summary(
+                events,
+                mapping_activity_events_path=activity,
+            )
+            self.assertTrue(summary["activity_cross_validation_performed"])
+            self.assertEqual(
+                summary["activity_cross_validation"]["exact_match_count"],
+                2,
+            )
+
+            activity.write_text(
+                self._activity_jsonl_for_events(events, mutate_first=True),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(parser.ValidationError, "cross validation"):
+                parser.build_summary(events, mapping_activity_events_path=activity)
+
+            activity.write_text(
+                self._activity_jsonl_for_events(events, offset_keys=True),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(parser.ValidationError, "cross validation"):
+                parser.build_summary(events, mapping_activity_events_path=activity)
+
     def test_sample_every_controls_only_logging(self) -> None:
         instance = scheduler(logging_enabled=True, sample_every=2)
         output = io.StringIO()
@@ -569,6 +738,7 @@ class LoggingAndParserTests(unittest.TestCase):
             run_log = root / "run.log"
             jsonl = root / "events.jsonl"
             summary = root / "summary.json"
+            markdown = root / "summary.md"
             run_log.write_text(text, encoding="utf-8")
 
             with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
@@ -579,6 +749,8 @@ class LoggingAndParserTests(unittest.TestCase):
                         str(jsonl),
                         "--summary",
                         str(summary),
+                        "--markdown",
+                        str(markdown),
                     ]
                 )
             self.assertEqual(first_rc, 0)
@@ -589,9 +761,14 @@ class LoggingAndParserTests(unittest.TestCase):
             self.assertEqual(recovered, events)
             built_summary = json.loads(summary.read_text(encoding="utf-8"))
             self.assertTrue(built_summary["validation_pass"])
+            self.assertIn(
+                "Historical Camera Scheduler v0 Evidence Summary",
+                markdown.read_text(encoding="utf-8"),
+            )
             run_log_before = run_log.read_bytes()
             jsonl_before = jsonl.read_bytes()
             summary_before = summary.read_bytes()
+            markdown_before = markdown.read_bytes()
 
             with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
                 second_rc = parser.main(
@@ -601,12 +778,49 @@ class LoggingAndParserTests(unittest.TestCase):
                         str(jsonl),
                         "--summary",
                         str(summary),
+                        "--markdown",
+                        str(markdown),
                     ]
                 )
             self.assertNotEqual(second_rc, 0)
             self.assertEqual(run_log.read_bytes(), run_log_before)
             self.assertEqual(jsonl.read_bytes(), jsonl_before)
             self.assertEqual(summary.read_bytes(), summary_before)
+            self.assertEqual(markdown.read_bytes(), markdown_before)
+
+    def test_cli_activity_cross_validation_and_markdown(self) -> None:
+        text, events = self._captured_events(count=2)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            run_log = root / "run.log"
+            activity = root / "activity.jsonl"
+            jsonl = root / "events.jsonl"
+            summary = root / "summary.json"
+            markdown = root / "summary.md"
+            run_log.write_text(text, encoding="utf-8")
+            activity.write_text(
+                self._activity_jsonl_for_events(events),
+                encoding="utf-8",
+            )
+
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                rc = parser.main(
+                    [
+                        str(run_log),
+                        "--mapping-activity-events",
+                        str(activity),
+                        "--jsonl",
+                        str(jsonl),
+                        "--summary",
+                        str(summary),
+                        "--markdown",
+                        str(markdown),
+                    ]
+                )
+            self.assertEqual(rc, 0)
+            built_summary = json.loads(summary.read_text(encoding="utf-8"))
+            self.assertTrue(built_summary["activity_cross_validation_performed"])
+            self.assertIn("Activity", markdown.read_text(encoding="utf-8"))
 
     def test_invalid_log_creates_no_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -614,6 +828,7 @@ class LoggingAndParserTests(unittest.TestCase):
             run_log = root / "run.log"
             jsonl = root / "events.jsonl"
             summary = root / "summary.json"
+            markdown = root / "summary.md"
             run_log.write_text(
                 "prefix [HistoricalCameraScheduler] {broken\n",
                 encoding="utf-8",
@@ -626,11 +841,14 @@ class LoggingAndParserTests(unittest.TestCase):
                         str(jsonl),
                         "--summary",
                         str(summary),
+                        "--markdown",
+                        str(markdown),
                     ]
                 )
             self.assertNotEqual(rc, 0)
             self.assertFalse(jsonl.exists())
             self.assertFalse(summary.exists())
+            self.assertFalse(markdown.exists())
 
 
 class OnlineIntegrationSourceContractTests(unittest.TestCase):
