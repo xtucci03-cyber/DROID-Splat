@@ -38,14 +38,18 @@ test "$EXPERIMENT_PACKAGE_SHA" = "$REMOTE_PACKAGE_SHA" \
 test -z "$(git -C "$WT" status --short)" \
     || die "worktree is not clean"
 
-mapfile -t commit_line < <(
-    git -C "$WT" rev-list --parents -n 1 "$EXPERIMENT_PACKAGE_SHA"
-)
-read -r -a commit_parts <<< "${commit_line[0]}"
-test "${#commit_parts[@]}" -eq 2 \
-    || die "experiment package commit must have exactly one parent"
-test "${commit_parts[1]}" = "$ALGORITHM_PARENT_SHA" \
-    || die "algorithm parent mismatch: ${commit_parts[1]}"
+git -C "$WT" merge-base --is-ancestor \
+    "$ALGORITHM_PARENT_SHA" \
+    "$EXPERIMENT_PACKAGE_SHA" \
+    || die "algorithm parent is not an ancestor of experiment package"
+
+readonly PACKAGE_COMMIT_COUNT="$(
+    git -C "$WT" rev-list --count \
+        "$ALGORITHM_PARENT_SHA..$EXPERIMENT_PACKAGE_SHA"
+)"
+
+test "$PACKAGE_COMMIT_COUNT" -ge 1 \
+    || die "experiment package contains no commits after algorithm parent"
 
 readonly EXPECTED_PACKAGE_FILES="$(
     printf '%s\n' \
