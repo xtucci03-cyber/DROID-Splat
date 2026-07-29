@@ -25,6 +25,7 @@ from .gaussian_splatting.gaussian_renderer import render
 from .gaussian_splatting.scene.gaussian_model import GaussianModel
 from .gaussian_splatting.camera_utils import Camera
 from .losses import mapping_rgbd_loss, plot_losses
+from .camera_scheduling import build_historical_camera_scheduler
 from .mapping_activity_observer import MappingActivityObserver
 from .resource_management import ResourceAdmission
 
@@ -81,6 +82,11 @@ class GaussianMapper(object):
         self.n_last_frames = self.update_params.n_last_frames  # Consider the recent n frames
         # Consider additional n random frames (This helps against catastrophic forgetting)# Consider additional n random frames (This helps against catastrophic forgetting)
         self.n_rand_frames = self.update_params.n_rand_frames
+        self.camera_scheduler = build_historical_camera_scheduler(
+            cfg.mapping.get("camera_scheduler", None),
+            n_last_frames=self.n_last_frames,
+            n_rand_frames=self.n_rand_frames,
+        )
         # How to filter the Tracking map before Rendering
         self.filter_params = self.update_params.filter
 
@@ -1760,7 +1766,17 @@ class GaussianMapper(object):
             do_densify = (
                 iter % self.update_params.prune_densify_every == 0 and iter < self.update_params.prune_densify_until
             )
-            frames = self.select_keyframes()[0] + self.new_cameras
+            if self.camera_scheduler is None:
+                frames = self.select_keyframes()[0] + self.new_cameras
+            else:
+                scheduler_result = self.camera_scheduler.select(
+                    historical_cameras=self.cameras,
+                    new_cameras=self.new_cameras,
+                    mapper_update_id=self.count,
+                    mapping_iteration=iter,
+                    baseline_selector=lambda: self.select_keyframes()[0],
+                )
+                frames = scheduler_result.frames
             loss = self.mapping_step(
                 iter, frames, prune_densify=do_densify, optimize_poses=self.update_params.optimize_poses
             )
