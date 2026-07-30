@@ -23,6 +23,11 @@ import lietorch
 from plyfile import PlyData, PlyElement
 from simple_knn._C import distCUDA2
 
+from ...gaussian_candidate_observer import (
+    CandidateGenerationResult,
+    GaussianCandidateObserver,
+    collect_candidate_generation_metadata,
+)
 from ..utils.general_utils import (
     build_rotation,
     build_scaling_rotation,
@@ -356,7 +361,15 @@ class GaussianModel:
         return optimizable_tensors
 
     def create_pcd_from_image_and_depth(
-        self, cam, rgb, depth, init=False, downsample_factor=None, with_normals: bool = False
+        self,
+        cam,
+        rgb,
+        depth,
+        init=False,
+        downsample_factor=None,
+        with_normals: bool = False,
+        collect_candidate_metadata: bool = False,
+        depth_source: str = "unknown",
     ):
         if downsample_factor is None:
             if init:
@@ -380,6 +393,11 @@ class GaussianModel:
             extrinsic=W2C,
             project_valid_depth_only=True,
         )
+        pre_downsample_point_count = (
+            int(np.asarray(pcd_tmp.points).shape[0])
+            if collect_candidate_metadata
+            else None
+        )
         if with_normals:
             # FIXME should we tune these parameters since they depend on the scene scale?
             pcd_tmp.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30))
@@ -387,6 +405,15 @@ class GaussianModel:
         pcd_tmp = pcd_tmp.random_down_sample(1.0 / downsample_factor)
         new_xyz = np.asarray(pcd_tmp.points)
         new_rgb = np.asarray(pcd_tmp.colors)
+        candidate_metadata = None
+        if collect_candidate_metadata:
+            candidate_metadata = collect_candidate_generation_metadata(
+                depth=depth,
+                depth_source=depth_source,
+                pre_downsample_point_count=pre_downsample_point_count,
+                post_downsample_point_count=int(new_xyz.shape[0]),
+                depth_trunc=100.0,
+            )
         # NOTE some monocular depth prediction networks like OmniDepth actually can output normals on top
         # We could also use this information if we wanted
         if with_normals:
@@ -396,6 +423,11 @@ class GaussianModel:
             pcd = BasicPointCloud(points=new_xyz, colors=new_rgb, normals=np.zeros((new_xyz.shape[0], 3)))
 
         if pcd.points.shape[0] <= 5:
+            if collect_candidate_metadata:
+                return CandidateGenerationResult(
+                    candidates=None,
+                    metadata=candidate_metadata,
+                )
             return
 
         self.ply_input = pcd
@@ -427,7 +459,13 @@ class GaussianModel:
             0.5 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device=self.device)
         )
 
-        return fused_point_cloud, features, scales, rots, opacities
+        candidates = fused_point_cloud, features, scales, rots, opacities
+        if collect_candidate_metadata:
+            return CandidateGenerationResult(
+                candidates=candidates,
+                metadata=candidate_metadata,
+            )
+        return candidates
 
     def create_pcd_from_image(
         self,
@@ -437,6 +475,7 @@ class GaussianModel:
         depthmap: np.ndarray = None,
         mask: torch.Tensor = None,
         downsample_factor: float = None,
+        collect_candidate_metadata: bool = False,
     ):
         image_ab = (torch.exp(cam.exposure_a)) * cam.original_image / 255.0 + cam.exposure_b
         image_ab = torch.clamp(image_ab, 0.0, 1.0)
@@ -445,13 +484,19 @@ class GaussianModel:
         ### Get depth map
         if depthmap is not None and depthmap.sum() > 0:
             depth_raw = depthmap
+            if collect_candidate_metadata:
+                depth_source = "explicit_depthmap"
         else:
             # Take the attached depth
             if cam.depth is not None and cam.depth.sum() > 0:
                 depth_raw = cam.depth.contiguous().cpu().numpy()
+                if collect_candidate_metadata:
+                    depth_source = "estimated_clean_depth"
             # Take the prior if given
             elif cam.depth_prior is not None and cam.depth_prior.sum() > 0:
                 depth_raw = cam.depth_prior.contiguous().cpu().numpy()
+                if collect_candidate_metadata:
+                    depth_source = "depth_prior"
             # If we don't have a depth signal, initialize from random
             else:
                 print(colored("Initializing Gaussians from RANDOM depth ...!", "red"))
@@ -460,6 +505,8 @@ class GaussianModel:
                     depth_raw = (
                         np.ones(rgb_raw.shape[:2]) + (np.random.randn(rgb_raw.shape[:2]) - 0.5) * 0.05
                     ) * scale
+                    if collect_candidate_metadata:
+                        depth_source = "random_initialization"
                 else:
                     # Take the depth of a small neighborhood of Gaussian keyframes
                     neighbors = torch.arange(max(0, cam.uid - 1), cam.uid + 1, device=self.unique_kfIDs.device)
@@ -467,24 +514,40 @@ class GaussianModel:
                     neighbors_scale = self.get_avg_scale(kfIdx=neighbors, factor=1.5)
                     if neighbors_scale is not None:
                         depth_raw = np.ones(rgb_raw.shape[:2]) * neighbors_scale
+                        if collect_candidate_metadata:
+                            depth_source = "neighbor_scale_fallback"
                     else:
                         depth_raw = (
                             np.ones(rgb_raw.shape[:2])
                             + (np.random.randn(rgb_raw.shape[0], rgb_raw.shape[1]) - 0.5) * 0.05
                         ) * scale
+                        if collect_candidate_metadata:
+                            depth_source = "random_initialization"
 
             # Introduce random Gaussians, this is how MonoGS works in monocular mode
             if self.cfg.sensor_type == "monocular":
                 depth_raw = (
                     np.ones_like(depth_raw) + (np.random.randn(depth_raw.shape[0], depth_raw.shape[1]) - 0.5) * 0.05
                 ) * scale
+                if collect_candidate_metadata:
+                    depth_source = "random_initialization"
 
         if mask is not None:
             depth_raw[~mask.cpu().numpy()] = 0.0
         depth = o3d.geometry.Image(depth_raw.astype(np.float32))
         rgb = o3d.geometry.Image(rgb_raw.astype(np.uint8))
 
-        return self.create_pcd_from_image_and_depth(cam, rgb, depth, init, downsample_factor=downsample_factor)
+        return self.create_pcd_from_image_and_depth(
+            cam,
+            rgb,
+            depth,
+            init,
+            downsample_factor=downsample_factor,
+            collect_candidate_metadata=collect_candidate_metadata,
+            depth_source=(
+                depth_source if collect_candidate_metadata else "unknown"
+            ),
+        )
 
     def extend_from_pcd(self, fused_point_cloud, features, scales, rots, opacities, kf_id):
         new_xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
@@ -511,17 +574,57 @@ class GaussianModel:
         )
 
     def extend_from_pcd_seq(
-        self, cam_info, kf_id=-1, init=False, scale=2.0, depthmap=None, mask=None, downsample_factor=None
+        self,
+        cam_info,
+        kf_id=-1,
+        init=False,
+        scale=2.0,
+        depthmap=None,
+        mask=None,
+        downsample_factor=None,
+        candidate_observer: Optional[GaussianCandidateObserver] = None,
+        mapper_update_id: Optional[int] = None,
     ):
-        features = self.create_pcd_from_image(
-            cam_info, init, scale=scale, depthmap=depthmap, mask=mask, downsample_factor=downsample_factor
-        )
+        if candidate_observer is None:
+            features = self.create_pcd_from_image(
+                cam_info, init, scale=scale, depthmap=depthmap, mask=mask, downsample_factor=downsample_factor
+            )
+            candidate_metadata = None
+        else:
+            generation_result = self.create_pcd_from_image(
+                cam_info,
+                init,
+                scale=scale,
+                depthmap=depthmap,
+                mask=mask,
+                downsample_factor=downsample_factor,
+                collect_candidate_metadata=True,
+            )
+            features = generation_result.candidates
+            candidate_metadata = generation_result.metadata
+
         if features is not None:
             fused_point_cloud, features, scales, rots, opacities = features
+            candidate_token = None
+            if candidate_observer is not None:
+                candidate_token = candidate_observer.observe_before_extend(
+                    xyz=fused_point_cloud,
+                    features=features,
+                    scales=scales,
+                    rotations=rots,
+                    opacities=opacities,
+                    current_gaussian_xyz=self.get_xyz,
+                    metadata=candidate_metadata,
+                    mapper_update_id=mapper_update_id,
+                    source_camera_id=cam_info.uid,
+                    init=init,
+                )
 
             # OURS-M01: Candidate admission hook before persistent Gaussian insertion.
             if self.resource_admission is None:
                 self.extend_from_pcd(fused_point_cloud, features, scales, rots, opacities, kf_id)
+                admitted_candidate_count = int(fused_point_cloud.shape[0])
+                dropped_candidate_count = 0
             else:
                 result = self.resource_admission.admit_before_extend(
                     xyz=fused_point_cloud,
@@ -543,13 +646,36 @@ class GaussianModel:
                     result.opacities,
                     kf_id,
                 )
+                admitted_candidate_count = result.admitted_count
+                dropped_candidate_count = result.dropped_count
 
                 self.resource_admission.record_after_extend(
                     result,
                     gaussian_after_extend=len(self),
                 )
+            if candidate_observer is not None:
+                candidate_observer.record_after_extend(
+                    candidate_token,
+                    admitted_candidate_count=admitted_candidate_count,
+                    dropped_candidate_count=dropped_candidate_count,
+                    gaussian_after_extend=len(self),
+                )
         else:
             print("No points in the point cloud")
+            if candidate_observer is not None:
+                candidate_token = candidate_observer.observe_empty(
+                    current_gaussian_xyz=self.get_xyz,
+                    metadata=candidate_metadata,
+                    mapper_update_id=mapper_update_id,
+                    source_camera_id=cam_info.uid,
+                    init=init,
+                )
+                candidate_observer.record_after_extend(
+                    candidate_token,
+                    admitted_candidate_count=0,
+                    dropped_candidate_count=0,
+                    gaussian_after_extend=len(self),
+                )
 
     def prune_points(self, mask):
         valid_points_mask = ~mask

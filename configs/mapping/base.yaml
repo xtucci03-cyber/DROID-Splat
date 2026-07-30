@@ -60,6 +60,20 @@ activity_observer:
   collect_memory: true
   gradient_eps: 0.0
 
+# Default-off, observe-only diagnostics for newly generated Gaussian
+# candidates. Observe mode requires an explicit positive voxel_size.
+candidate_observer:
+  mode: "off"
+  coverage:
+    method: voxel_occupancy
+    voxel_size: null
+  timing:
+    gpu: false
+  memory:
+    enabled: false
+  logging:
+    enabled: true
+
 # Default-off historical-camera scheduling. Enabled configurations must keep
 # history_budget <= online_opt.n_rand_frames.
 camera_scheduler:
