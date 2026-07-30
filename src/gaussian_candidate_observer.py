@@ -400,6 +400,29 @@ class GaussianCandidateObserver:
 
     schema = SCHEMA_VERSION
 
+    @staticmethod
+    def _normalize_current_gaussian_xyz(
+        current_gaussian_xyz: torch.Tensor,
+    ) -> torch.Tensor:
+        """Normalize only the legacy one-dimensional empty map representation."""
+
+        if (
+            isinstance(current_gaussian_xyz, torch.Tensor)
+            and current_gaussian_xyz.ndim == 1
+            and current_gaussian_xyz.numel() == 0
+        ):
+            return current_gaussian_xyz.reshape(0, 3)
+        if (
+            not isinstance(current_gaussian_xyz, torch.Tensor)
+            or current_gaussian_xyz.ndim != 2
+            or current_gaussian_xyz.shape[1] != 3
+        ):
+            raise ValueError(
+                "current_gaussian_xyz must have shape [G,3], got "
+                f"{getattr(current_gaussian_xyz, 'shape', None)}."
+            )
+        return current_gaussian_xyz
+
     def __init__(
         self,
         *,
@@ -642,15 +665,9 @@ class GaussianCandidateObserver:
                 rotations=rotations,
                 opacities=opacities,
             )
-            if (
-                not isinstance(current_gaussian_xyz, torch.Tensor)
-                or current_gaussian_xyz.ndim != 2
-                or current_gaussian_xyz.shape[1] != 3
-            ):
-                raise ValueError(
-                    "current_gaussian_xyz must have shape [G,3], got "
-                    f"{getattr(current_gaussian_xyz, 'shape', None)}."
-                )
+            current_gaussian_xyz = self._normalize_current_gaussian_xyz(
+                current_gaussian_xyz
+            )
             if current_gaussian_xyz.device != xyz.device:
                 raise ValueError(
                     "Candidate/current-map device mismatch: "

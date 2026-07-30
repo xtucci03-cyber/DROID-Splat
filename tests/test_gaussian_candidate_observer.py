@@ -230,14 +230,125 @@ class CandidateGenerationMetadataTests(unittest.TestCase):
 
 
 class CandidateVoxelEvidenceTests(unittest.TestCase):
+    def test_initial_one_dimensional_empty_map_is_normalized(self) -> None:
+        built = build_observer()
+        xyz = torch.tensor(
+            [[0.1, 0.1, 0.1], [1.2, 0.0, 0.0]],
+            dtype=torch.float32,
+        )
+        bundle = candidates(xyz)
+        identities = [id(tensor) for tensor in bundle]
+        clones = [tensor.clone() for tensor in bundle]
+        current = torch.empty(0, dtype=torch.float32)
+
+        token = built.observe_before_extend(
+            xyz=bundle[0],
+            features=bundle[1],
+            scales=bundle[2],
+            rotations=bundle[3],
+            opacities=bundle[4],
+            current_gaussian_xyz=current,
+            metadata=metadata(2),
+            mapper_update_id=0,
+            source_camera_id=0,
+            init=True,
+        )
+        output = io.StringIO()
+        with redirect_stdout(output):
+            summary = built.record_after_extend(
+                token,
+                admitted_candidate_count=2,
+                dropped_candidate_count=0,
+                gaussian_after_extend=2,
+            )
+
+        lines = output.getvalue().splitlines()
+        self.assertEqual(len(lines), 1)
+        event = json.loads(lines[0][lines[0].index("{") :])
+        self.assertEqual(event["status"], "ok")
+        self.assertIsNone(event["error"])
+        self.assertTrue(event["init"])
+        self.assertEqual(event["candidate_finite_count"], 2)
+        self.assertEqual(event["candidate_nonfinite_count"], 0)
+        self.assertEqual(event["existing_gaussian_count"], 0)
+        self.assertEqual(event["occupied_candidate_count"], 0)
+        self.assertEqual(event["novel_candidate_count"], 2)
+        self.assertEqual(event["candidate_unique_voxel_count"], 2)
+        self.assertEqual(event["admitted_candidate_count"], 2)
+        self.assertEqual(event["dropped_candidate_count"], 0)
+        self.assertTrue(event["all_candidates_admitted"])
+        self.assertTrue(event["conservation_pass"])
+        self.assertEqual(event["gaussian_before"], 0)
+        self.assertEqual(event["gaussian_after_extend"], 2)
+        self.assertEqual([id(tensor) for tensor in bundle], identities)
+        for actual, expected in zip(bundle, clones):
+            self.assertTrue(torch.equal(actual, expected))
+        self.assertEqual(summary.to_event(), event)
+
     def test_empty_map_marks_all_finite_candidates_novel(self) -> None:
         event, _ = observe(
             torch.tensor([[0.1, 0.1, 0.1], [1.2, 0.0, 0.0]]),
             torch.empty((0, 3)),
         )
+        self.assertEqual(event["status"], "ok")
+        self.assertIsNone(event["error"])
+        self.assertEqual(event["existing_gaussian_count"], 0)
         self.assertEqual(event["occupied_candidate_count"], 0)
         self.assertEqual(event["novel_candidate_count"], 2)
         self.assertEqual(event["candidate_unique_voxel_count"], 2)
+
+    def test_standard_and_nonempty_maps_preserve_original_objects(self) -> None:
+        standard_empty = torch.empty((0, 3), dtype=torch.float32)
+        nonempty = torch.tensor(
+            [[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]],
+            dtype=torch.float32,
+        )
+
+        self.assertIs(
+            GaussianCandidateObserver._normalize_current_gaussian_xyz(
+                standard_empty
+            ),
+            standard_empty,
+        )
+        self.assertIs(
+            GaussianCandidateObserver._normalize_current_gaussian_xyz(
+                nonempty
+            ),
+            nonempty,
+        )
+
+        event, _ = observe(
+            torch.tensor([[0.1, 0.1, 0.1], [2.0, 0.0, 0.0]]),
+            nonempty,
+        )
+        self.assertEqual(event["status"], "ok")
+        self.assertEqual(event["existing_gaussian_count"], 2)
+
+    def test_nonempty_one_dimensional_map_remains_invalid(self) -> None:
+        with self.assertRaisesRegex(ValueError, r"shape \[G,3\]"):
+            GaussianCandidateObserver._normalize_current_gaussian_xyz(
+                torch.tensor([1.0, 2.0, 3.0])
+            )
+
+        event, _ = observe(
+            torch.tensor([[0.1, 0.1, 0.1]]),
+            torch.tensor([1.0, 2.0, 3.0]),
+        )
+        self.assertEqual(event["status"], "error")
+        self.assertEqual(event["error"]["type"], "ValueError")
+
+    def test_invalid_two_dimensional_map_remains_invalid(self) -> None:
+        with self.assertRaisesRegex(ValueError, r"shape \[G,3\]"):
+            GaussianCandidateObserver._normalize_current_gaussian_xyz(
+                torch.empty((2, 2))
+            )
+
+        event, _ = observe(
+            torch.tensor([[0.1, 0.1, 0.1]]),
+            torch.empty((2, 2)),
+        )
+        self.assertEqual(event["status"], "error")
+        self.assertEqual(event["error"]["type"], "ValueError")
 
     def test_empty_candidate_has_null_ratios_and_extents(self) -> None:
         event, _ = observe(

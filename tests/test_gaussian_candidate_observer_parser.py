@@ -161,6 +161,48 @@ class CandidateObserverParserExtractionTests(unittest.TestCase):
 
 
 class CandidateObserverParserOutputTests(unittest.TestCase):
+    def test_initial_empty_map_event_generates_valid_summary(self) -> None:
+        event = valid_event(mapper_update_id=0, source_camera_id=0)
+        event.update(
+            {
+                "init": True,
+                "existing_gaussian_count": 0,
+                "gaussian_before": 0,
+                "gaussian_after_extend": 2,
+                "occupied_candidate_count": 0,
+                "novel_candidate_count": 2,
+                "occupied_ratio": 0.0,
+                "novel_ratio": 1.0,
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            run_log = root / "run.log"
+            run_log.write_text(
+                line_for(event) + "\n",
+                encoding="utf-8",
+            )
+            output_dir = root / "summary"
+            with redirect_stdout(io.StringIO()):
+                result = parser.main(
+                    [
+                        str(run_log),
+                        "--output-dir",
+                        str(output_dir),
+                    ]
+                )
+
+            self.assertEqual(result, 0)
+            summary = json.loads(
+                (
+                    output_dir / "candidate_observer_summary.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertTrue(summary["validation_pass"])
+            self.assertEqual(summary["event_count"], 1)
+            self.assertEqual(summary["error_event_count"], 0)
+
     def test_summary_contains_required_aggregates(self) -> None:
         first = valid_event()
         second = valid_event(mapper_update_id=3, source_camera_id=6)
