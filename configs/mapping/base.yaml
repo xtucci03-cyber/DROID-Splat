@@ -74,6 +74,14 @@ candidate_observer:
   logging:
     enabled: true
 
+# Default-off, observe-only simulation of per-occupied-voxel candidate caps.
+# Dry-run inherits the Candidate Observer's actual voxel_size and never filters.
+candidate_selector:
+  mode: "off"
+  algorithm: occupied_voxel_cap_k_v0
+  logging:
+    enabled: true
+
 # Default-off historical-camera scheduling. Enabled configurations must keep
 # history_budget <= online_opt.n_rand_frames.
 camera_scheduler:

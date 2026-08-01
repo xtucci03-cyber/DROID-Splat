@@ -28,6 +28,7 @@ from ...gaussian_candidate_observer import (
     GaussianCandidateObserver,
     collect_candidate_generation_metadata,
 )
+from ...candidate_selection import GaussianCandidateSelectorDryRun
 from ..utils.general_utils import (
     build_rotation,
     build_scaling_rotation,
@@ -583,8 +584,13 @@ class GaussianModel:
         mask=None,
         downsample_factor=None,
         candidate_observer: Optional[GaussianCandidateObserver] = None,
+        candidate_selector: Optional[GaussianCandidateSelectorDryRun] = None,
         mapper_update_id: Optional[int] = None,
     ):
+        if candidate_selector is not None and candidate_observer is None:
+            raise ValueError(
+                "candidate_selector requires candidate_observer to be active."
+            )
         if candidate_observer is None:
             features = self.create_pcd_from_image(
                 cam_info, init, scale=scale, depthmap=depthmap, mask=mask, downsample_factor=downsample_factor
@@ -615,6 +621,19 @@ class GaussianModel:
                     opacities=opacities,
                     current_gaussian_xyz=self.get_xyz,
                     metadata=candidate_metadata,
+                    mapper_update_id=mapper_update_id,
+                    source_camera_id=cam_info.uid,
+                    init=init,
+                )
+
+            if candidate_selector is not None:
+                selector_token = candidate_selector.observe_before_extend(
+                    xyz=fused_point_cloud,
+                    features=features,
+                    scales=scales,
+                    rotations=rots,
+                    opacities=opacities,
+                    current_gaussian_xyz=self.get_xyz,
                     mapper_update_id=mapper_update_id,
                     source_camera_id=cam_info.uid,
                     init=init,
@@ -660,6 +679,13 @@ class GaussianModel:
                     dropped_candidate_count=dropped_candidate_count,
                     gaussian_after_extend=len(self),
                 )
+            if candidate_selector is not None:
+                candidate_selector.record_after_extend(
+                    selector_token,
+                    admitted_candidate_count=admitted_candidate_count,
+                    dropped_candidate_count=dropped_candidate_count,
+                    gaussian_after_extend=len(self),
+                )
         else:
             print("No points in the point cloud")
             if candidate_observer is not None:
@@ -672,6 +698,19 @@ class GaussianModel:
                 )
                 candidate_observer.record_after_extend(
                     candidate_token,
+                    admitted_candidate_count=0,
+                    dropped_candidate_count=0,
+                    gaussian_after_extend=len(self),
+                )
+            if candidate_selector is not None:
+                selector_token = candidate_selector.observe_empty(
+                    current_gaussian_xyz=self.get_xyz,
+                    mapper_update_id=mapper_update_id,
+                    source_camera_id=cam_info.uid,
+                    init=init,
+                )
+                candidate_selector.record_after_extend(
+                    selector_token,
                     admitted_candidate_count=0,
                     dropped_candidate_count=0,
                     gaussian_after_extend=len(self),

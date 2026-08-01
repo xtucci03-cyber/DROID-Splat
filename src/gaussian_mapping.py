@@ -26,6 +26,7 @@ from .gaussian_splatting.scene.gaussian_model import GaussianModel
 from .gaussian_splatting.camera_utils import Camera
 from .losses import mapping_rgbd_loss, plot_losses
 from .camera_scheduling import build_historical_camera_scheduler
+from .candidate_selection import build_gaussian_candidate_selector
 from .gaussian_candidate_observer import build_gaussian_candidate_observer
 from .mapping_activity_observer import MappingActivityObserver
 from .resource_management import ResourceAdmission
@@ -124,6 +125,12 @@ class GaussianMapper(object):
 
         self.candidate_observer = build_gaussian_candidate_observer(
             cfg.mapping.get("candidate_observer", None),
+            resource_admission_mode=resource_admission_mode,
+            device=self.device,
+        )
+        self.candidate_selector = build_gaussian_candidate_selector(
+            cfg.mapping.get("candidate_selector", None),
+            candidate_observer=self.candidate_observer,
             resource_admission_mode=resource_admission_mode,
             device=self.device,
         )
@@ -1647,7 +1654,7 @@ class GaussianMapper(object):
                 self.initialized = True
                 if self.candidate_observer is None:
                     self.gaussians.extend_from_pcd_seq(cam, cam.uid, init=True)
-                else:
+                elif self.candidate_selector is None:
                     self.gaussians.extend_from_pcd_seq(
                         cam,
                         cam.uid,
@@ -1655,17 +1662,35 @@ class GaussianMapper(object):
                         candidate_observer=self.candidate_observer,
                         mapper_update_id=self.count,
                     )
+                else:
+                    self.gaussians.extend_from_pcd_seq(
+                        cam,
+                        cam.uid,
+                        init=True,
+                        candidate_observer=self.candidate_observer,
+                        candidate_selector=self.candidate_selector,
+                        mapper_update_id=self.count,
+                    )
                 self.info(f"Initialized with {len(self.gaussians)} gaussians for view {cam.uid}")
             else:
                 ng_before = len(self.gaussians)
                 if self.candidate_observer is None:
                     self.gaussians.extend_from_pcd_seq(cam, cam.uid, init=False)
+                elif self.candidate_selector is None:
+                    self.gaussians.extend_from_pcd_seq(
+                        cam,
+                        cam.uid,
+                        init=False,
+                        candidate_observer=self.candidate_observer,
+                        mapper_update_id=self.count,
+                    )
                 else:
                     self.gaussians.extend_from_pcd_seq(
                         cam,
                         cam.uid,
                         init=False,
                         candidate_observer=self.candidate_observer,
+                        candidate_selector=self.candidate_selector,
                         mapper_update_id=self.count,
                     )
 
