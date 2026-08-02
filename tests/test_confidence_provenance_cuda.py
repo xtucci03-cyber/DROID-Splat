@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import queue
 import time
 import unittest
@@ -18,63 +19,96 @@ from tests.test_confidence_provenance import (
 )
 
 
-def _cuda_writer(video: DepthVideo, index: int, value: float, result_queue) -> None:
+def _take_cuda_video(video_holder) -> DepthVideo:
+    if len(video_holder) != 1:
+        raise RuntimeError(f"expected one CUDA video reference, got {len(video_holder)}")
+    return video_holder.pop()
+
+
+def _publish_worker_result(result_queue, result) -> None:
+    result_queue.put(result)
+    result_queue.close()
+    result_queue.join_thread()
+
+
+def _run_cuda_consumer(video_holder, result_queue, operation, *args) -> None:
+    video = None
     try:
+        video = _take_cuda_video(video_holder)
         torch.cuda.set_device(torch.device(video.device))
-        write_current_confidence(video, index, value)
-        result_queue.put(
-            {
-                "status": "ok",
-                "version": int(video.confidence_versions[index].item()),
-                "up_version": int(video.confidence_up_versions[index].item()),
-            }
-        )
+        result = operation(video, *args)
     except Exception as exc:  # pragma: no cover - diagnostic path for the formal CUDA gate
-        result_queue.put({"status": "error", "type": type(exc).__name__, "message": str(exc)})
+        result = {"status": "error", "type": type(exc).__name__, "message": str(exc)}
+    finally:
+        released = False
+        if video is not None:
+            try:
+                torch.cuda.synchronize(device=torch.device(video.device))
+                video = None
+                gc.collect()
+                released = True
+            except Exception as exc:  # pragma: no cover - diagnostic path for the formal CUDA gate
+                result = {"status": "error", "type": type(exc).__name__, "message": str(exc)}
+        result["cuda_consumer_released"] = released
+        _publish_worker_result(result_queue, result)
+
+
+def _write_confidence_operation(video: DepthVideo, index: int, value: float):
+    write_current_confidence(video, index, value)
+    return {
+        "status": "ok",
+        "version": int(video.confidence_versions[index].item()),
+        "up_version": int(video.confidence_up_versions[index].item()),
+    }
+
+
+def _cuda_writer(video_holder, index: int, value: float, result_queue) -> None:
+    _run_cuda_consumer(video_holder, result_queue, _write_confidence_operation, index, value)
+
+
+def _locked_write_operation(video: DepthVideo, ba_lock, entered, release):
+    with ba_lock:
+        entered.set()
+        if not release.wait(timeout=20):
+            raise TimeoutError("writer release event timed out")
+        write_current_confidence(video, 2, 0.875)
+    return {"status": "ok"}
 
 
 def _locked_cuda_writer(
-    video: DepthVideo,
+    video_holder,
     ba_lock,
     entered,
     release,
     result_queue,
 ) -> None:
-    try:
-        torch.cuda.set_device(torch.device(video.device))
-        with ba_lock:
-            entered.set()
-            if not release.wait(timeout=20):
-                raise TimeoutError("writer release event timed out")
-            write_current_confidence(video, 2, 0.875)
-        result_queue.put({"status": "ok"})
-    except Exception as exc:  # pragma: no cover - diagnostic path for the formal CUDA gate
-        result_queue.put({"status": "error", "type": type(exc).__name__, "message": str(exc)})
+    _run_cuda_consumer(video_holder, result_queue, _locked_write_operation, ba_lock, entered, release)
 
 
-def _locked_remove(video: DepthVideo, ba_lock, entered, result_queue) -> None:
-    try:
-        torch.cuda.set_device(torch.device(video.device))
-        if not entered.wait(timeout=20):
-            raise TimeoutError("writer did not enter BA lock")
-        with ba_lock:
-            make_factor_graph_for_removal(video).rm_keyframe(1)
-            with video.get_lock():
-                video.counter.value -= 1
-        result_queue.put({"status": "ok"})
-    except Exception as exc:  # pragma: no cover - diagnostic path for the formal CUDA gate
-        result_queue.put({"status": "error", "type": type(exc).__name__, "message": str(exc)})
-
-
-def _reuse_slot_writer(video: DepthVideo, entered, result_queue) -> None:
-    try:
-        torch.cuda.set_device(torch.device(video.device))
+def _locked_remove_operation(video: DepthVideo, ba_lock, entered):
+    if not entered.wait(timeout=20):
+        raise TimeoutError("writer did not enter BA lock")
+    with ba_lock:
+        graph = make_factor_graph_for_removal(video)
+        graph.rm_keyframe(1)
         with video.get_lock():
-            entered.set()
-            video._DepthVideo__item_setter(0, frame_item(video, 99.0, 99))
-        result_queue.put({"status": "ok"})
-    except Exception as exc:  # pragma: no cover - diagnostic path for the formal CUDA gate
-        result_queue.put({"status": "error", "type": type(exc).__name__, "message": str(exc)})
+            video.counter.value -= 1
+    return {"status": "ok"}
+
+
+def _locked_remove(video_holder, ba_lock, entered, result_queue) -> None:
+    _run_cuda_consumer(video_holder, result_queue, _locked_remove_operation, ba_lock, entered)
+
+
+def _reuse_slot_operation(video: DepthVideo, entered):
+    with video.get_lock():
+        entered.set()
+        video._DepthVideo__item_setter(0, frame_item(video, 99.0, 99))
+    return {"status": "ok"}
+
+
+def _reuse_slot_writer(video_holder, entered, result_queue) -> None:
+    _run_cuda_consumer(video_holder, result_queue, _reuse_slot_operation, entered)
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "formal CUDA provenance gate requires CUDA")
@@ -92,19 +126,50 @@ class ConfidenceProvenanceCudaTests(unittest.TestCase):
         self.video.append(*frame_item(self.video, timestamp, image_value))
         return int(self.video.source_frame_ids[self.video.counter.value - 1].item())
 
+    def start_process(self, process) -> None:
+        process.start()
+        self.addCleanup(self.stop_process, process)
+
+    @staticmethod
+    def stop_process(process) -> None:
+        try:
+            if process.is_alive():
+                process.terminate()
+            process.join(timeout=5)
+            process.close()
+        except ValueError:
+            # A normally completed process is already closed by join_or_fail().
+            pass
+
     def join_or_fail(self, process) -> None:
         process.join(timeout=self.timeout_seconds)
+        timed_out = process.is_alive()
         if process.is_alive():
             process.terminate()
             process.join(timeout=5)
-            self.fail(f"{process.name} exceeded {self.timeout_seconds}s; possible lock deadlock")
-        self.assertEqual(process.exitcode, 0, f"{process.name} exited with {process.exitcode}")
+        process_name = process.name
+        exitcode = process.exitcode
+        process.close()
+        if timed_out:
+            self.fail(f"{process_name} exceeded {self.timeout_seconds}s; possible lock deadlock")
+        self.assertEqual(exitcode, 0, f"{process_name} exited with {exitcode}")
+
+    def make_result_queue(self, context):
+        result_queue = context.Queue()
+        self.addCleanup(self.close_result_queue, result_queue)
+        return result_queue
+
+    @staticmethod
+    def close_result_queue(result_queue) -> None:
+        result_queue.close()
+        result_queue.join_thread()
 
     def get_worker_result(self, result_queue):
         try:
             result = result_queue.get(timeout=5)
         except queue.Empty:
             self.fail("worker produced no result")
+        self.assertTrue(result.get("cuda_consumer_released"), result)
         self.assertEqual(result.get("status"), "ok", result)
         return result
 
@@ -125,13 +190,13 @@ class ConfidenceProvenanceCudaTests(unittest.TestCase):
     def test_cuda_shared_write_value_and_versions_are_visible_cross_process(self) -> None:
         source_id = self.append_frame(1.0, 1)
         context = mp.get_context("spawn")
-        result_queue = context.Queue()
+        result_queue = self.make_result_queue(context)
         process = context.Process(
             target=_cuda_writer,
-            args=(self.video, 0, 0.625, result_queue),
+            args=([self.video], 0, 0.625, result_queue),
             name="confidence-cuda-writer",
         )
-        process.start()
+        self.start_process(process)
         self.join_or_fail(process)
         result = self.get_worker_result(result_queue)
         snapshot = self.video.get_confidence_snapshot(0, source_id)
@@ -147,19 +212,19 @@ class ConfidenceProvenanceCudaTests(unittest.TestCase):
         ba_lock = context.RLock()
         entered = context.Event()
         release = context.Event()
-        result_queue = context.Queue()
+        result_queue = self.make_result_queue(context)
         writer = context.Process(
             target=_locked_cuda_writer,
-            args=(self.video, ba_lock, entered, release, result_queue),
+            args=([self.video], ba_lock, entered, release, result_queue),
             name="backend-confidence-writer",
         )
         remover = context.Process(
             target=_locked_remove,
-            args=(self.video, ba_lock, entered, result_queue),
+            args=([self.video], ba_lock, entered, result_queue),
             name="frontend-keyframe-remover",
         )
-        writer.start()
-        remover.start()
+        self.start_process(writer)
+        self.start_process(remover)
         self.assertTrue(entered.wait(timeout=10), "writer never entered BA lock")
         time.sleep(0.1)
         release.set()
@@ -176,13 +241,13 @@ class ConfidenceProvenanceCudaTests(unittest.TestCase):
         old_source_id = self.append_frame(1.0, 1)
         context = mp.get_context("spawn")
         entered = context.Event()
-        result_queue = context.Queue()
+        result_queue = self.make_result_queue(context)
         writer = context.Process(
             target=_reuse_slot_writer,
-            args=(self.video, entered, result_queue),
+            args=([self.video], entered, result_queue),
             name="slot-reuse-writer",
         )
-        writer.start()
+        self.start_process(writer)
         self.assertTrue(entered.wait(timeout=10), "slot writer never entered video lock")
         item = self.video.get_mapping_item(0, device="cuda:0", return_frame_identity=True)
         self.join_or_fail(writer)
