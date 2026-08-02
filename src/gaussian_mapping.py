@@ -26,7 +26,10 @@ from .gaussian_splatting.scene.gaussian_model import GaussianModel
 from .gaussian_splatting.camera_utils import Camera
 from .losses import mapping_rgbd_loss, plot_losses
 from .camera_scheduling import build_historical_camera_scheduler
-from .candidate_selection import build_gaussian_candidate_selector
+from .candidate_selection import (
+    build_gaussian_candidate_selector,
+    build_gaussian_candidate_selector_v1,
+)
 from .gaussian_candidate_observer import build_gaussian_candidate_observer
 from .mapping_activity_observer import MappingActivityObserver
 from .resource_management import ResourceAdmission
@@ -132,6 +135,13 @@ class GaussianMapper(object):
             cfg.mapping.get("candidate_selector", None),
             candidate_observer=self.candidate_observer,
             resource_admission_mode=resource_admission_mode,
+            device=self.device,
+        )
+        self.candidate_selector_v1 = build_gaussian_candidate_selector_v1(
+            cfg.mapping.get("candidate_selector_v1", None),
+            candidate_observer=self.candidate_observer,
+            resource_admission_mode=resource_admission_mode,
+            confidence_snapshot_getter=self.get_camera_confidence_snapshot,
             device=self.device,
         )
 
@@ -1693,7 +1703,10 @@ class GaussianMapper(object):
                 self.initialized = True
                 if self.candidate_observer is None:
                     self.gaussians.extend_from_pcd_seq(cam, cam.uid, init=True)
-                elif self.candidate_selector is None:
+                elif (
+                    self.candidate_selector is None
+                    and self.candidate_selector_v1 is None
+                ):
                     self.gaussians.extend_from_pcd_seq(
                         cam,
                         cam.uid,
@@ -1702,20 +1715,33 @@ class GaussianMapper(object):
                         mapper_update_id=self.count,
                     )
                 else:
+                    candidate_diagnostics = {
+                        "candidate_observer": self.candidate_observer,
+                        "mapper_update_id": self.count,
+                    }
+                    if self.candidate_selector is not None:
+                        candidate_diagnostics["candidate_selector"] = (
+                            self.candidate_selector
+                        )
+                    if self.candidate_selector_v1 is not None:
+                        candidate_diagnostics["candidate_selector_v1"] = (
+                            self.candidate_selector_v1
+                        )
                     self.gaussians.extend_from_pcd_seq(
                         cam,
                         cam.uid,
                         init=True,
-                        candidate_observer=self.candidate_observer,
-                        candidate_selector=self.candidate_selector,
-                        mapper_update_id=self.count,
+                        **candidate_diagnostics,
                     )
                 self.info(f"Initialized with {len(self.gaussians)} gaussians for view {cam.uid}")
             else:
                 ng_before = len(self.gaussians)
                 if self.candidate_observer is None:
                     self.gaussians.extend_from_pcd_seq(cam, cam.uid, init=False)
-                elif self.candidate_selector is None:
+                elif (
+                    self.candidate_selector is None
+                    and self.candidate_selector_v1 is None
+                ):
                     self.gaussians.extend_from_pcd_seq(
                         cam,
                         cam.uid,
@@ -1724,13 +1750,23 @@ class GaussianMapper(object):
                         mapper_update_id=self.count,
                     )
                 else:
+                    candidate_diagnostics = {
+                        "candidate_observer": self.candidate_observer,
+                        "mapper_update_id": self.count,
+                    }
+                    if self.candidate_selector is not None:
+                        candidate_diagnostics["candidate_selector"] = (
+                            self.candidate_selector
+                        )
+                    if self.candidate_selector_v1 is not None:
+                        candidate_diagnostics["candidate_selector_v1"] = (
+                            self.candidate_selector_v1
+                        )
                     self.gaussians.extend_from_pcd_seq(
                         cam,
                         cam.uid,
                         init=False,
-                        candidate_observer=self.candidate_observer,
-                        candidate_selector=self.candidate_selector,
-                        mapper_update_id=self.count,
+                        **candidate_diagnostics,
                     )
 
         return cam
