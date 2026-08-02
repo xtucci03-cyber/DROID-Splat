@@ -528,7 +528,9 @@ def droid_visualization(video, save_root: str = "results", device="cuda:0"):
         masks = (count >= droid_visualization.mv_filter_count) & (disps > 0.5 * disps.mean(dim=[1, 2], keepdim=True))
 
         if droid_visualization.uncertainty_filter_on:
-            weights = torch.index_select(video.confidence, 0, dirty_index)
+            with video.confidence_lock:
+                weights = torch.index_select(video.confidence, 0, dirty_index)
+                video._synchronize_confidence_device()
             masks2 = weights > droid_visualization.unc_filter_thresh
             masks = masks & masks2.cpu()
 

@@ -835,10 +835,12 @@ class SLAM:
                 # Plot the uncertainty on top
                 with self.video.get_lock():
                     t_cur = max(0, self.video.counter.value - 1)
-                    if self.cfg.tracking.get("upsample", False):
-                        uncertanity_cur = self.video.confidence_up[t_cur].clone()
-                    else:
-                        uncertanity_cur = self.video.confidence[t_cur].clone()
+                    with self.video.confidence_lock:
+                        if self.cfg.tracking.get("upsample", False):
+                            uncertanity_cur = self.video.confidence_up[t_cur].clone()
+                        else:
+                            uncertanity_cur = self.video.confidence[t_cur].clone()
+                        self.video._synchronize_confidence_device()
                 uncertainty_img = uncertainty2rgb(uncertanity_cur)[0]
                 cv2.imshow("Uncertainty", uncertainty_img[..., ::-1])
                 cv2.waitKey(1)

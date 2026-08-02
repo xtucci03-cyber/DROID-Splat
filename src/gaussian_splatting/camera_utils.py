@@ -21,10 +21,16 @@ class Camera(nn.Module):
         img_size: Tuple[int, int],
         device: str = "cuda:0",
         mask: Optional[torch.Tensor] = None,
+        buffer_index: Optional[int] = None,
+        source_frame_id: Optional[int] = None,
+        source_timestamp: Optional[float] = None,
     ):
         super(Camera, self).__init__()
         self.uid = uid
         self.device = device
+        self.buffer_index = buffer_index
+        self.source_frame_id = source_frame_id
+        self.source_timestamp = source_timestamp
 
         self.fx, self.fy, self.cx, self.cy = intrinsics
         self.FoVx, self.FoVy = fov
@@ -89,6 +95,9 @@ class Camera(nn.Module):
             (self.image_height, self.image_width),
             self.device,
             self.mask.clone().detach() if self.mask is not None else None,
+            buffer_index=self.buffer_index,
+            source_frame_id=self.source_frame_id,
+            source_timestamp=self.source_timestamp,
         )
 
     @staticmethod

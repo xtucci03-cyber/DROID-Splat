@@ -465,15 +465,29 @@ class GaussianMapper(object):
         """Return the number of camera frames in the scene."""
         return len(self.cameras)
 
+    def _get_mapping_item(self, idx, use_gt=False, *, return_frame_identity: bool = False):
+        """Read mapping payload under the same BA lock used by Frontend and Backend writers."""
+        with self.slam.ba_lock:
+            return self.video.get_mapping_item(
+                idx,
+                use_gt=use_gt,
+                device=self.device,
+                return_frame_identity=return_frame_identity,
+            )
+
     def camera_from_video(self, idx):
         """Extract Camera objects from a part of the video."""
         if self.video.disps_clean[idx].sum() < 1:  # Sanity check:
             self.info(f"Warning. Trying to intialize from empty frame {idx}!")
             return None
 
-        color, depth, depth_prior, intrinsics, w2c_lie, stat_mask = self.video.get_mapping_item(idx, self.device)
+        color, depth, depth_prior, intrinsics, w2c_lie, stat_mask, frame_identity = self._get_mapping_item(
+            idx, use_gt=self.device, return_frame_identity=True
+        )
         w2c = lie_to_matrix(w2c_lie)
-        return self.camera_from_frame(idx, color, w2c, intrinsics, depth, mask=stat_mask)
+        return self.camera_from_frame(
+            idx, color, w2c, intrinsics, depth, mask=stat_mask, frame_identity=frame_identity
+        )
 
     def camera_from_frame(
         self,
@@ -484,6 +498,7 @@ class GaussianMapper(object):
         depth_init: Optional[torch.Tensor] = None,
         depth: Optional[torch.Tensor] = None,
         mask: Optional[torch.Tensor] = None,
+        frame_identity: Optional[Dict] = None,
     ):
         """Given the image, depth, intrinsic and pose, creates a Camera object.
         The depth for supervision and initialization does not need to be the same, e.g. we could initialize
@@ -509,6 +524,9 @@ class GaussianMapper(object):
             (height, width),
             device=self.device,
             mask=mask,
+            buffer_index=frame_identity["buffer_index"] if frame_identity is not None else None,
+            source_frame_id=frame_identity["source_frame_id"] if frame_identity is not None else None,
+            source_timestamp=frame_identity["source_timestamp"] if frame_identity is not None else None,
         )
 
     def get_new_cameras(self, delay=0):
@@ -521,8 +539,8 @@ class GaussianMapper(object):
             to_add = range(self.last_idx, self.cur_idx - delay)
 
         for idx in to_add:
-            color, depth, depth_prior, intrinsics, w2c_lie, stat_mask = self.video.get_mapping_item(
-                idx, device=self.device
+            color, depth, depth_prior, intrinsics, w2c_lie, stat_mask, frame_identity = self._get_mapping_item(
+                idx, return_frame_identity=True
             )
             w2c = lie_to_matrix(w2c_lie)
 
@@ -532,7 +550,14 @@ class GaussianMapper(object):
             if (depth_prior > 0).sum() < 100:
                 depth_prior = None
             cam = self.camera_from_frame(
-                idx, color, w2c, intrinsics, depth_init=depth, depth=depth_prior, mask=stat_mask
+                idx,
+                color,
+                w2c,
+                intrinsics,
+                depth_init=depth,
+                depth=depth_prior,
+                mask=stat_mask,
+                frame_identity=frame_identity,
             )
 
             # Insert camera into index mapping
@@ -544,6 +569,22 @@ class GaussianMapper(object):
                 self.n_optimized[cam.uid] = 0
 
             self.new_cameras.append(cam)
+
+    def get_camera_confidence_snapshot(self, camera: Camera, require_current: bool = True):
+        """Return a provenance-checked clone for an explicit future confidence consumer.
+
+        Existing mapping and all observer-off paths do not call this method.
+        """
+        if camera.buffer_index is None or camera.source_frame_id is None:
+            raise ValueError("camera has no immutable DepthVideo frame identity.")
+        with self.slam.ba_lock:
+            return self.video.get_confidence_snapshot(
+                index=camera.buffer_index,
+                expected_source_frame_id=camera.source_frame_id,
+                expected_timestamp=camera.source_timestamp,
+                upsampled=self.video.upsampled,
+                require_current=require_current,
+            )
 
     def get_pose_optimizer(self, frames: List) -> torch.optim.Optimizer:
         """Creates an optimizer for the camera poses for all provided frames.
@@ -595,9 +636,7 @@ class GaussianMapper(object):
 
         for idx in to_update:
             # TODO can the stat_mask potentially change as well?
-            color, depth, depth_prior, intrinsics, w2c_lie, stat_mask = self.video.get_mapping_item(
-                idx, device=self.device
-            )
+            color, depth, depth_prior, intrinsics, w2c_lie, stat_mask = self._get_mapping_item(idx)
             w2c = lie_to_matrix(w2c_lie)
 
             cam = all_cameras[self.buffer2cam[idx.item()]]

@@ -134,10 +134,13 @@ class Frontend:
 
         # If the distance is too small, remove the last keyframe
         if d.item() < self.keyframe_thresh:
-            self.graph.rm_keyframe(self.t1 - 2)
-            with self.video.get_lock():
-                self.video.counter.value -= 1
-                self.t1 -= 1
+            # Slot compaction must share the BA lock with Frontend/Backend confidence writers. The nested order is
+            # BA lock -> video slot lock -> confidence lock.
+            with lock:
+                self.graph.rm_keyframe(self.t1 - 2)
+                with self.video.get_lock():
+                    self.video.counter.value -= 1
+                    self.t1 -= 1
 
         # Optimize again
         else:

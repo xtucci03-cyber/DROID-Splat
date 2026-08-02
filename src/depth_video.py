@@ -1,7 +1,8 @@
 import ipdb
 from termcolor import colored
 from copy import deepcopy
-from typing import Optional, List
+from dataclasses import dataclass
+from typing import Optional, List, Tuple
 
 import torch
 import torch.multiprocessing as mp
@@ -15,6 +16,29 @@ from .geom.ba import bundle_adjustment
 
 from .gaussian_splatting.camera_utils import Camera
 from .gaussian_splatting.gaussian_renderer import render
+
+
+class ConfidenceSnapshotError(RuntimeError):
+    """Raised when a confidence snapshot cannot be tied to the requested frame."""
+
+
+@dataclass(frozen=True)
+class ConfidenceSnapshot:
+    """Immutable metadata plus a cloned confidence tensor for one video slot."""
+
+    buffer_index: int
+    source_frame_id: int
+    source_timestamp: float
+    confidence_source_frame_id: int
+    confidence_version: int
+    confidence_up_version: int
+    is_current: bool
+    is_stale: bool
+    confidence: torch.Tensor
+    shape: Tuple[int, ...]
+    dtype: str
+    device: str
+    requires_grad: bool
 
 
 class DepthVideo:
@@ -38,6 +62,8 @@ class DepthVideo:
 
         self.ready = mp.Value("i", 0)
         self.counter = mp.Value("i", 0)
+        self.source_frame_counter = mp.Value("q", 0)
+        self.confidence_lock = mp.RLock()
 
         ht = cfg.data.cam.H_out
         self.ht = ht
@@ -76,6 +102,17 @@ class DepthVideo:
         # Estimated confidence weights for Optimization reduced for each node from factor graph
         self.confidence = torch.zeros(buffer, ht // s, wd // s, device=device, dtype=torch.float)
         self.confidence_up = torch.zeros(buffer, ht, wd, device=device, dtype=torch.float).share_memory_()
+        # A buffer index is reusable. These identities and versions tie confidence to the immutable frame generation
+        # currently occupying each slot.
+        # Publish provenance on CPU shared memory only after the corresponding CUDA write has completed. This makes
+        # the CPU lock/version protocol meaningful across CUDA processes and avoids treating an enqueued write as ready.
+        self.source_frame_ids = torch.full((buffer,), -1, dtype=torch.long).share_memory_()
+        self.confidence_source_frame_ids = torch.full((buffer,), -1, dtype=torch.long).share_memory_()
+        self.confidence_up_source_frame_ids = torch.full((buffer,), -1, dtype=torch.long).share_memory_()
+        self.confidence_versions = torch.zeros(buffer, dtype=torch.long).share_memory_()
+        self.confidence_up_versions = torch.zeros(buffer, dtype=torch.long).share_memory_()
+        self.confidence_valid = torch.zeros(buffer, dtype=torch.bool).share_memory_()
+        self.confidence_up_valid = torch.zeros(buffer, dtype=torch.bool).share_memory_()
 
         self.disps_sens_up = torch.zeros(buffer, ht, wd, device=device, dtype=torch.float).share_memory_()
         self.disps_sens = torch.zeros(buffer, ht // s, wd // s, device=device, dtype=torch.float).share_memory_()
@@ -112,6 +149,206 @@ class DepthVideo:
 
     def get_lock(self):
         return self.counter.get_lock()
+
+    @staticmethod
+    def _metadata_index(index):
+        if isinstance(index, torch.Tensor) and index.device.type != "cpu":
+            return index.detach().to(device="cpu")
+        return index
+
+    def _synchronize_confidence_device(self) -> None:
+        if torch.device(self.device).type == "cuda":
+            torch.cuda.synchronize(device=self.device)
+
+    def _allocate_source_frame_ids_locked(self, index) -> None:
+        index = self._metadata_index(index)
+        target = self.source_frame_ids[index]
+        count = target.numel()
+        with self.source_frame_counter.get_lock():
+            start = self.source_frame_counter.value
+            self.source_frame_counter.value += count
+        frame_ids = torch.arange(start, start + count, dtype=torch.long).reshape(target.shape)
+        self.source_frame_ids[index] = frame_ids
+
+    def _invalidate_confidence_locked(self, index, clear_values: bool = True) -> None:
+        metadata_index = self._metadata_index(index)
+        self.confidence_valid[metadata_index] = False
+        self.confidence_up_valid[metadata_index] = False
+        if clear_values:
+            self.confidence[index].zero_()
+            self.confidence_up[index].zero_()
+            self._synchronize_confidence_device()
+        self.confidence_source_frame_ids[metadata_index] = -1
+        self.confidence_up_source_frame_ids[metadata_index] = -1
+        self.confidence_versions[metadata_index] = 0
+        self.confidence_up_versions[metadata_index] = 0
+
+    def _write_confidence_locked(self, index, value: torch.Tensor) -> None:
+        metadata_index = self._metadata_index(index)
+        source_frame_ids = self.source_frame_ids[metadata_index]
+        if bool(torch.any(source_frame_ids < 0).item()):
+            raise ConfidenceSnapshotError(
+                f"cannot publish confidence for inactive buffer slot(s): {metadata_index}."
+            )
+        self.confidence_valid[metadata_index] = False
+        self.confidence[index] = value
+        self._synchronize_confidence_device()
+        self.confidence_versions[metadata_index] += 1
+        self.confidence_source_frame_ids[metadata_index] = source_frame_ids
+        self.confidence_valid[metadata_index] = True
+
+    def move_confidence_slot(self, destination: int, source: int, invalidate_source: bool = True) -> None:
+        """Move confidence and provenance while the caller holds the video slot lock."""
+        with self.confidence_lock:
+            moved_source_frame_id = int(self.source_frame_ids[source].item())
+            moved_confidence_source_frame_id = int(self.confidence_source_frame_ids[source].item())
+            moved_confidence_up_source_frame_id = int(self.confidence_up_source_frame_ids[source].item())
+            moved_confidence_version = int(self.confidence_versions[source].item())
+            moved_confidence_up_version = int(self.confidence_up_versions[source].item())
+            moved_confidence_valid = bool(self.confidence_valid[source].item())
+            moved_confidence_up_valid = bool(self.confidence_up_valid[source].item())
+            self.source_frame_ids[destination] = -1
+            self.confidence_valid[destination] = False
+            self.confidence_up_valid[destination] = False
+            self.confidence[destination] = self.confidence[source]
+            self.confidence_up[destination] = self.confidence_up[source]
+            if invalidate_source:
+                self.source_frame_ids[source] = -1
+                self.confidence_valid[source] = False
+                self.confidence_up_valid[source] = False
+                self.confidence[source].zero_()
+                self.confidence_up[source].zero_()
+            self._synchronize_confidence_device()
+            self.source_frame_ids[destination] = moved_source_frame_id
+            self.confidence_source_frame_ids[destination] = moved_confidence_source_frame_id
+            self.confidence_up_source_frame_ids[destination] = moved_confidence_up_source_frame_id
+            self.confidence_versions[destination] = moved_confidence_version
+            self.confidence_up_versions[destination] = moved_confidence_up_version
+            self.confidence_valid[destination] = moved_confidence_valid
+            self.confidence_up_valid[destination] = moved_confidence_up_valid
+            if invalidate_source:
+                self.confidence_source_frame_ids[source] = -1
+                self.confidence_up_source_frame_ids[source] = -1
+                self.confidence_versions[source] = 0
+                self.confidence_up_versions[source] = 0
+
+    def get_frame_identity(self, index: int) -> Tuple[int, float]:
+        """Return the immutable generation id and timestamp currently occupying a reusable slot."""
+        if isinstance(index, bool) or not isinstance(index, int):
+            raise TypeError(f"buffer index must be an integer, got {type(index).__name__}.")
+        with self.get_lock():
+            if index < 0 or index >= self.counter.value:
+                raise IndexError(f"buffer index {index} is outside active range [0, {self.counter.value}).")
+            return int(self.source_frame_ids[index].item()), float(self.timestamp[index].item())
+
+    def get_confidence_snapshot(
+        self,
+        index: int,
+        expected_source_frame_id: int,
+        expected_timestamp: Optional[float] = None,
+        upsampled: bool = True,
+        require_current: bool = True,
+    ) -> ConfidenceSnapshot:
+        """Clone confidence with identity/version validation under the shared writer protocol."""
+        if isinstance(index, bool) or not isinstance(index, int):
+            raise TypeError(f"buffer index must be an integer, got {type(index).__name__}.")
+        if isinstance(expected_source_frame_id, bool) or not isinstance(expected_source_frame_id, int):
+            raise TypeError("expected_source_frame_id must be an integer.")
+
+        with self.get_lock():
+            if index < 0 or index >= self.counter.value:
+                raise ConfidenceSnapshotError(
+                    f"buffer index {index} is outside active range [0, {self.counter.value})."
+                )
+            with self.confidence_lock:
+                source_frame_id = int(self.source_frame_ids[index].item())
+                source_timestamp = float(self.timestamp[index].item())
+                if source_frame_id != expected_source_frame_id:
+                    raise ConfidenceSnapshotError(
+                        "confidence frame identity mismatch: "
+                        f"slot {index} contains source_frame_id={source_frame_id}, "
+                        f"expected {expected_source_frame_id}."
+                    )
+                if expected_timestamp is not None and source_timestamp != float(expected_timestamp):
+                    raise ConfidenceSnapshotError(
+                        "confidence frame timestamp mismatch: "
+                        f"slot {index} contains timestamp={source_timestamp!r}, "
+                        f"expected {float(expected_timestamp)!r}."
+                    )
+
+                confidence_version = int(self.confidence_versions[index].item())
+                confidence_up_version = int(self.confidence_up_versions[index].item())
+                if upsampled:
+                    valid = bool(self.confidence_up_valid[index].item())
+                    confidence_source_frame_id = int(self.confidence_up_source_frame_ids[index].item())
+                    confidence = self.confidence_up[index]
+                    expected_shape = (self.ht, self.wd)
+                    is_current = (
+                        valid
+                        and bool(self.confidence_valid[index].item())
+                        and confidence_source_frame_id == source_frame_id
+                        and int(self.confidence_source_frame_ids[index].item()) == source_frame_id
+                        and confidence_version > 0
+                        and confidence_up_version == confidence_version
+                    )
+                else:
+                    valid = bool(self.confidence_valid[index].item())
+                    confidence_source_frame_id = int(self.confidence_source_frame_ids[index].item())
+                    confidence = self.confidence[index]
+                    expected_shape = (self.ht // self.scale_factor, self.wd // self.scale_factor)
+                    is_current = (
+                        valid
+                        and confidence_source_frame_id == source_frame_id
+                        and confidence_version > 0
+                    )
+
+                is_stale = valid and not is_current
+                if not valid:
+                    raise ConfidenceSnapshotError(
+                        f"confidence for buffer index {index}, source_frame_id={source_frame_id} is not valid."
+                    )
+                if require_current and not is_current:
+                    raise ConfidenceSnapshotError(
+                        "confidence snapshot is stale: "
+                        f"buffer_index={index}, source_frame_id={source_frame_id}, "
+                        f"confidence_source_frame_id={confidence_source_frame_id}, "
+                        f"confidence_version={confidence_version}, "
+                        f"confidence_up_version={confidence_up_version}."
+                    )
+                if tuple(confidence.shape) != expected_shape:
+                    raise ConfidenceSnapshotError(
+                        f"confidence shape mismatch: expected {expected_shape}, got {tuple(confidence.shape)}."
+                    )
+                if confidence.dtype != torch.float32:
+                    raise ConfidenceSnapshotError(
+                        f"confidence dtype mismatch: expected torch.float32, got {confidence.dtype}."
+                    )
+                if confidence.device != torch.device(self.device):
+                    raise ConfidenceSnapshotError(
+                        f"confidence device mismatch: expected {torch.device(self.device)}, got {confidence.device}."
+                    )
+                if not bool(torch.isfinite(confidence).all().item()):
+                    raise ConfidenceSnapshotError(
+                        f"confidence for buffer index {index}, source_frame_id={source_frame_id} contains NaN or Inf."
+                    )
+
+                snapshot = confidence.clone()
+                self._synchronize_confidence_device()
+                return ConfidenceSnapshot(
+                    buffer_index=index,
+                    source_frame_id=source_frame_id,
+                    source_timestamp=source_timestamp,
+                    confidence_source_frame_id=confidence_source_frame_id,
+                    confidence_version=confidence_version,
+                    confidence_up_version=confidence_up_version,
+                    is_current=is_current,
+                    is_stale=is_stale,
+                    confidence=snapshot,
+                    shape=tuple(snapshot.shape),
+                    dtype=str(snapshot.dtype),
+                    device=str(snapshot.device),
+                    requires_grad=snapshot.requires_grad,
+                )
 
     def __item_setter(self, index, item):
         if isinstance(index, int) and index >= self.counter.value:
@@ -155,6 +392,10 @@ class DepthVideo:
         if len(item) > 10 and item[10] is not None:
             self.static_masks[index] = item[10]
 
+        with self.confidence_lock:
+            self._allocate_source_frame_ids_locked(index)
+            self._invalidate_confidence_locked(index)
+
     def __setitem__(self, index, item):
         with self.get_lock():
             self.__item_setter(index, item)
@@ -184,27 +425,33 @@ class DepthVideo:
         to optimize intermediate poses before returning them. Keeping the overall video buffer clean afterwards should
         be a priority.
         """
-        self.timestamp[index] = torch.zeros_like(self.timestamp[index], dtype=torch.float, device=self.device)
-        self.images[index] = torch.zeros_like(self.images[index], dtype=torch.uint8, device=self.device)
-        self.intrinsics[index] = torch.zeros_like(self.intrinsics[index], dtype=torch.float, device=self.device)
+        with self.get_lock():
+            self.timestamp[index] = torch.zeros_like(self.timestamp[index], dtype=torch.float, device=self.device)
+            self.images[index] = torch.zeros_like(self.images[index], dtype=torch.uint8, device=self.device)
+            self.intrinsics[index] = torch.zeros_like(self.intrinsics[index], dtype=torch.float, device=self.device)
 
-        zero_poses = torch.zeros_like(self.poses[index], dtype=torch.float, device=self.device)
-        zero_poses[:] = torch.tensor([0, 0, 0, 0, 0, 0, 1], dtype=torch.float, device=self.device)
-        self.poses[index] = zero_poses
-        self.poses_gt[index] = zero_poses
+            zero_poses = torch.zeros_like(self.poses[index], dtype=torch.float, device=self.device)
+            zero_poses[:] = torch.tensor([0, 0, 0, 0, 0, 0, 1], dtype=torch.float, device=self.device)
+            self.poses[index] = zero_poses
+            self.poses_gt[index] = zero_poses
 
-        self.disps[index] = torch.ones_like(self.disps[index], dtype=torch.float, device=self.device)
-        self.disps_up[index] = torch.zeros_like(self.disps_up[index], dtype=torch.float, device=self.device)
-        self.disps_sens[index] = torch.zeros_like(self.disps_sens[index], dtype=torch.float, device=self.device)
-        self.disps_sens_up[index] = torch.zeros_like(self.disps_sens_up[index], dtype=torch.float, device=self.device)
-        self.scales[index] = torch.ones_like(self.scales[index], dtype=torch.float, device=self.device)
-        self.shifts[index] = torch.zeros_like(self.shifts[index], dtype=torch.float, device=self.device)
+            self.disps[index] = torch.ones_like(self.disps[index], dtype=torch.float, device=self.device)
+            self.disps_up[index] = torch.zeros_like(self.disps_up[index], dtype=torch.float, device=self.device)
+            self.disps_sens[index] = torch.zeros_like(self.disps_sens[index], dtype=torch.float, device=self.device)
+            self.disps_sens_up[index] = torch.zeros_like(
+                self.disps_sens_up[index], dtype=torch.float, device=self.device
+            )
+            self.scales[index] = torch.ones_like(self.scales[index], dtype=torch.float, device=self.device)
+            self.shifts[index] = torch.zeros_like(self.shifts[index], dtype=torch.float, device=self.device)
 
-        self.fmaps[index] = torch.zeros_like(self.fmaps[index], dtype=torch.half, device=self.device)
-        self.nets[index] = torch.zeros_like(self.nets[index], dtype=torch.half, device=self.device)
-        self.inps[index] = torch.zeros_like(self.inps[index], dtype=torch.half, device=self.device)
+            self.fmaps[index] = torch.zeros_like(self.fmaps[index], dtype=torch.half, device=self.device)
+            self.nets[index] = torch.zeros_like(self.nets[index], dtype=torch.half, device=self.device)
+            self.inps[index] = torch.zeros_like(self.inps[index], dtype=torch.half, device=self.device)
 
-        self.static_masks[index] = torch.ones_like(self.static_masks[index], dtype=torch.bool, device=self.device)
+            self.static_masks[index] = torch.ones_like(self.static_masks[index], dtype=torch.bool, device=self.device)
+            with self.confidence_lock:
+                self.source_frame_ids[self._metadata_index(index)] = -1
+                self._invalidate_confidence_locked(index)
 
     def append(self, *item):
         with self.get_lock():
@@ -262,12 +509,16 @@ class DepthVideo:
                 disps = torch.index_select(self.disps_up, 0, dirty_index).clone()
                 intrinsics = self.intrinsics[0] * self.scale_factor
                 if uncertainty:
-                    conf = torch.index_select(self.confidence_up, 0, dirty_index).clone()
+                    with self.confidence_lock:
+                        conf = torch.index_select(self.confidence_up, 0, dirty_index).clone()
+                        self._synchronize_confidence_device()
             else:
                 disps = torch.index_select(self.disps, 0, dirty_index).clone()
                 intrinsics = self.intrinsics[0]
                 if uncertainty:
-                    conf = torch.index_select(self.confidence, 0, dirty_index).clone()
+                    with self.confidence_lock:
+                        conf = torch.index_select(self.confidence, 0, dirty_index).clone()
+                        self._synchronize_confidence_device()
 
         mask = torch.ones_like(disps, dtype=torch.bool)
         if multiview:
@@ -297,7 +548,7 @@ class DepthVideo:
         if return_mask:
             return mask
 
-    def get_mapping_item(self, index, use_gt=False, device="cuda:0"):
+    def get_mapping_item(self, index, use_gt=False, device="cuda:0", return_frame_identity=False):
         """Get a part of the video to transfer to the Rendering module"""
 
         s = self.scale_factor
@@ -331,7 +582,18 @@ class DepthVideo:
             else:
                 w2c = self.poses[index].clone().to(device)
 
-            return image, est_depth, depth_prior, intrinsics, w2c, static_mask
+            result = (image, est_depth, depth_prior, intrinsics, w2c, static_mask)
+            if return_frame_identity:
+                # The identity is published only after a slot write/move has completed. Finish these payload clones
+                # before releasing the same slot lock so a later slot reuse cannot tear the Camera snapshot.
+                self._synchronize_confidence_device()
+                frame_identity = {
+                    "buffer_index": int(index),
+                    "source_frame_id": int(self.source_frame_ids[index].item()),
+                    "source_timestamp": float(self.timestamp[index].item()),
+                }
+                return result + (frame_identity,)
+            return result
 
     def set_mapping_item(self, index: List[torch.Tensor], poses: List[torch.Tensor], depths: List[torch.Tensor]):
         """Set a part of the video from the Rendering module"""
@@ -407,8 +669,19 @@ class DepthVideo:
         disps_up = cvx_upsample(self.disps[ix].unsqueeze(dim=-1), mask)  # [b, h, w, 1]
         self.disps_up[ix] = disps_up.squeeze()  # [b, h, w]
 
-        confidence_up = cvx_upsample(self.confidence[ix].unsqueeze(-1), mask)  # [b, h, w, 1]
-        self.confidence_up[ix] = confidence_up.squeeze()  # [b, h, w]
+        with self.confidence_lock:
+            metadata_index = self._metadata_index(ix)
+            self.confidence_up_valid[metadata_index] = False
+            confidence_up = cvx_upsample(self.confidence[ix].unsqueeze(-1), mask)  # [b, h, w, 1]
+            self.confidence_up[ix] = confidence_up.squeeze()  # [b, h, w]
+            self._synchronize_confidence_device()
+            self.confidence_up_versions[metadata_index] = self.confidence_versions[metadata_index]
+            self.confidence_up_source_frame_ids[metadata_index] = self.confidence_source_frame_ids[metadata_index]
+            self.confidence_up_valid[metadata_index] = (
+                self.confidence_valid[metadata_index]
+                & (self.confidence_source_frame_ids[metadata_index] == self.source_frame_ids[metadata_index])
+                & (self.confidence_versions[metadata_index] > 0)
+            )
 
     def normalize(self):
         """normalize depth and poses"""
@@ -548,7 +821,8 @@ class DepthVideo:
             # Store the uncertainty maps for source frames, that will get updated
             confidence, idx = self.reduce_confidence(weight, ii)
             # Uncertainties are for [x, y] directions -> Take norm to get single scalar
-            self.confidence[idx] = torch.norm(confidence, dim=1)
+            with self.confidence_lock:
+                self._write_confidence_locked(idx, torch.norm(confidence, dim=1))
 
             # [t0, t1] window of bundle adjustment optimization
             if t1 is None:
@@ -659,7 +933,8 @@ class DepthVideo:
             # Store the uncertainty maps for source frames, that will get updated
             confidence, idx = self.reduce_confidence(weight, ii)
             # Uncertainties are for [x, y] directions -> Take norm to get single scalar
-            self.confidence[idx] = torch.norm(confidence, dim=1)
+            with self.confidence_lock:
+                self._write_confidence_locked(idx, torch.norm(confidence, dim=1))
 
             # [t0, t1] window of bundle adjustment optimization
             if t1 is None:
