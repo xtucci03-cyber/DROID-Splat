@@ -110,6 +110,8 @@ class ConfidenceProvenanceCudaTests(unittest.TestCase):
 
     def test_cuda_snapshot_metadata_device_and_clone_pointer(self) -> None:
         source_id = self.append_frame(1.0, 1)
+        self.assertEqual(self.video.confidence.device, torch.device("cuda:0"))
+        self.assertEqual(self.video.confidence.dtype, torch.float32)
         write_current_confidence(self.video, 0, 0.5)
         snapshot = self.video.get_confidence_snapshot(0, source_id)
         self.assertEqual(snapshot.source_frame_id, source_id)

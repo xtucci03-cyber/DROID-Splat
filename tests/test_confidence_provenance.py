@@ -100,8 +100,11 @@ def write_current_confidence(video: DepthVideo, index: int, value: float) -> Non
     low_resolution = torch.full(
         (1, video.ht // 8, video.wd // 8),
         value,
-        dtype=torch.float32,
+        dtype=video.confidence.dtype,
+        device=video.confidence.device,
     )
+    assert low_resolution.dtype == video.confidence.dtype
+    assert low_resolution.device == video.confidence.device
     with video.confidence_lock:
         video._write_confidence_locked(indices, low_resolution)
     video.upsample(indices, torch.empty(0))
@@ -177,6 +180,8 @@ class ConfidenceProvenanceTests(unittest.TestCase):
 
     def test_current_frame_write_and_snapshot_are_identity_checked_clone(self) -> None:
         source_id = self.append_frame(12.5, 12)
+        self.assertEqual(self.video.confidence.device, torch.device("cpu"))
+        self.assertEqual(self.video.confidence.dtype, torch.float32)
         write_current_confidence(self.video, 0, 0.5)
 
         mapping_item = self.video.get_mapping_item(
