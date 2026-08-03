@@ -39,10 +39,13 @@ class SnapshotGetter:
     def __init__(self, confidence: torch.Tensor):
         self.confidence = confidence
         self.calls = 0
+        self.upsampled_requests = []
+        self.last_snapshot = None
         self.overrides = {}
 
-    def __call__(self, camera, require_current=True):
+    def __call__(self, camera, require_current=True, *, upsampled=None):
         self.calls += 1
+        self.upsampled_requests.append(upsampled)
         values = {
             "buffer_index": camera.buffer_index,
             "source_frame_id": camera.source_frame_id,
@@ -59,7 +62,8 @@ class SnapshotGetter:
             "requires_grad": self.confidence.requires_grad,
         }
         values.update(self.overrides)
-        return SimpleNamespace(**values)
+        self.last_snapshot = SimpleNamespace(**values)
+        return self.last_snapshot
 
 
 def make_candidates(device="cpu"):
@@ -195,6 +199,11 @@ class GaussianCandidateSelectorV1Tests(unittest.TestCase):
         self.assertTrue(token.fields["observer_no_mutation"])
         self.assertNotIn("selected_indices", token.fields)
         self.assertEqual(getter.calls, 1)
+        self.assertEqual(getter.upsampled_requests, [False])
+        self.assertNotEqual(
+            getter.last_snapshot.confidence.data_ptr(),
+            getter.confidence.data_ptr(),
+        )
         for index, value in enumerate(candidates):
             self.assertEqual(value.data_ptr(), pointers[index])
             self.assertEqual(value._version, versions[index])
@@ -313,6 +322,112 @@ class GaussianCandidateSelectorV1Tests(unittest.TestCase):
                 self.assertEqual(token.fields["reason"], expected_reason)
                 self.assertTrue(token.fields["observer_no_mutation"])
 
+    def test_lowres_current_is_accepted_when_upsampled_version_is_stale(self):
+        observer, getter, camera, candidates, current_map = make_fixture()
+        getter.overrides.update(
+            {
+                "confidence_version": 46,
+                "confidence_up_version": 40,
+                "is_current": True,
+                "is_stale": False,
+            }
+        )
+
+        token = observe(observer, camera, candidates, current_map)
+
+        self.assertEqual(token.fields["status"], "ok")
+        self.assertEqual(getter.upsampled_requests, [False])
+        self.assertEqual(token.fields["confidence_version"], 46)
+        self.assertEqual(token.fields["confidence_up_version"], 40)
+        self.assertEqual(
+            token.fields["confidence_sampling_method"],
+            "lowres_cell_floor_v1",
+        )
+
+    def test_noninteger_resolution_mapping_preserves_boundaries_and_candidates(self):
+        source_height, source_width = 5, 7
+        depth = torch.zeros(source_height, source_width, dtype=torch.float32)
+        camera = FakeCamera(depth)
+        camera.fx = 1.0
+        camera.fy = 1.0
+        xyz = torch.tensor(
+            [
+                [0.0, 0.0, 1.0],
+                [6.0, 4.0, 1.0],
+                [2.0, 2.0, 1.0],
+                [3.0, 1.0, 1.0],
+            ],
+            dtype=torch.float32,
+        )
+        candidates = list(make_candidates())
+        candidates[0] = xyz
+        candidates = tuple(candidates)
+        depth[0, 0] = 1.0
+        depth[4, 6] = 1.0
+        depth[2, 2] = 1.0
+        depth[1, 3] = 1.0
+        confidence = torch.tensor(
+            [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]],
+            dtype=torch.float32,
+        )
+        getter = SnapshotGetter(confidence)
+        observer = GaussianCandidateSelectorV1(
+            voxel_size=0.05,
+            confidence_snapshot_getter=getter,
+            logging_enabled=True,
+            device="cpu",
+        )
+        clones = [value.clone() for value in candidates]
+        pointers = [value.data_ptr() for value in candidates]
+        versions = [value._version for value in candidates]
+
+        token = observe(observer, camera, candidates, torch.empty((0, 3)))
+
+        self.assertEqual(token.fields["status"], "ok")
+        self.assertEqual(token.fields["source_resolution"], [5, 7])
+        self.assertEqual(token.fields["confidence_resolution"], [2, 3])
+        self.assertAlmostEqual(token.fields["scale_x"], 7 / 3)
+        self.assertAlmostEqual(token.fields["scale_y"], 5 / 2)
+        low_u, low_v, _, _ = observer.map_source_pixels_to_confidence(
+            torch.tensor([0, 6, 2, 3]),
+            torch.tensor([0, 4, 2, 1]),
+            source_resolution=(5, 7),
+            confidence_resolution=(2, 3),
+        )
+        self.assertEqual(low_u.tolist(), [0, 2, 0, 1])
+        self.assertEqual(low_v.tolist(), [0, 1, 0, 0])
+        with self.assertRaisesRegex(ValueError, "out of bounds"):
+            observer.map_source_pixels_to_confidence(
+                torch.tensor([source_width]),
+                torch.tensor([0]),
+                source_resolution=(source_height, source_width),
+                confidence_resolution=(2, 3),
+            )
+        with self.assertRaisesRegex(ValueError, "out of bounds"):
+            observer.map_source_pixels_to_confidence(
+                torch.tensor([0]),
+                torch.tensor([source_height]),
+                source_resolution=(source_height, source_width),
+                confidence_resolution=(2, 3),
+            )
+        self.assertEqual(token.fields["valid_confidence_count"], 4)
+        self.assertTrue(token.fields["observer_no_mutation"])
+        for index, value in enumerate(candidates):
+            self.assertEqual(value.data_ptr(), pointers[index])
+            self.assertEqual(value._version, versions[index])
+            self.assertTrue(torch.equal(value, clones[index]))
+
+        with redirect_stdout(io.StringIO()):
+            summary = observer.record_after_extend(
+                token,
+                admitted_candidate_count=4,
+                dropped_candidate_count=0,
+                gaussian_after_extend=4,
+            )
+        self.assertTrue(summary.fields["all_candidates_forwarded"])
+        self.assertEqual(summary.fields["actual_dropped_count"], 0)
+        self.assertNotIn("selected_indices", summary.fields)
+
     def test_missing_nonfinite_and_mismatched_confidence_fail_closed(self):
         observer, getter, camera, candidates, current_map = make_fixture()
         getter.confidence[0, 0] = torch.inf
@@ -321,7 +436,7 @@ class GaussianCandidateSelectorV1Tests(unittest.TestCase):
         self.assertEqual(token.fields["reason"], "nonfinite_confidence")
 
         observer, getter, camera, candidates, current_map = make_fixture()
-        getter.confidence = torch.zeros(2, 2)
+        getter.confidence = torch.zeros(2, 2, 1)
         token = observe(observer, camera, candidates, current_map)
         self.assertEqual(token.fields["status"], "error")
         self.assertEqual(token.fields["reason"], "confidence_shape_mismatch")

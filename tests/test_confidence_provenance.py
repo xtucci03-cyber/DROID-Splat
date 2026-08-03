@@ -236,6 +236,22 @@ class ConfidenceProvenanceTests(unittest.TestCase):
         self.assertTrue(snapshot.is_stale)
         self.assertLess(snapshot.confidence_up_version, snapshot.confidence_version)
 
+        low_resolution_snapshot = self.video.get_confidence_snapshot(
+            0,
+            source_id,
+            upsampled=False,
+            require_current=True,
+        )
+        self.assertTrue(low_resolution_snapshot.is_current)
+        self.assertFalse(low_resolution_snapshot.is_stale)
+        self.assertEqual(low_resolution_snapshot.confidence_version, 2)
+        self.assertEqual(low_resolution_snapshot.confidence_up_version, 1)
+        self.assertEqual(low_resolution_snapshot.shape, (2, 3))
+        self.assertNotEqual(
+            low_resolution_snapshot.confidence.data_ptr(),
+            self.video.confidence[0].data_ptr(),
+        )
+
     def test_all_zero_is_valid_but_nan_inf_and_shape_mismatch_fail(self) -> None:
         source_id = self.append_frame(1.0, 1)
         write_current_confidence(self.video, 0, 0.0)

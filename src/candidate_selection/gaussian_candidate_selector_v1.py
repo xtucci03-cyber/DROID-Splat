@@ -29,6 +29,7 @@ K_VALUES = (1, 2, 4, 8)
 COUNTERFACTUAL_SORT = (
     "(candidate_voxel_id, -confidence, original_candidate_index)"
 )
+CONFIDENCE_SAMPLING_METHOD = "lowres_cell_floor_v1"
 
 _TOP_LEVEL_FIELDS = frozenset({"mode", "logging"})
 _LOGGING_FIELDS = frozenset({"enabled"})
@@ -420,6 +421,60 @@ class GaussianCandidateSelectorV1:
             return "missing_confidence"
         return "confidence_snapshot_unavailable"
 
+    @staticmethod
+    def map_source_pixels_to_confidence(
+        u: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        source_resolution: tuple[int, int],
+        confidence_resolution: tuple[int, int],
+    ) -> tuple[torch.Tensor, torch.Tensor, float, float]:
+        """Map source pixels to confidence cells without clamping."""
+        if u.shape != v.shape:
+            raise ValueError("Source pixel coordinate shape mismatch.")
+        source_height, source_width = source_resolution
+        confidence_height, confidence_width = confidence_resolution
+        if min(
+            source_height,
+            source_width,
+            confidence_height,
+            confidence_width,
+        ) <= 0:
+            raise ValueError("Confidence/source resolution must be positive.")
+        source_in_bounds = (
+            (u >= 0)
+            & (u < source_width)
+            & (v >= 0)
+            & (v < source_height)
+        )
+        if not bool(torch.all(source_in_bounds).item()):
+            raise ValueError("Source pixel coordinate is out of bounds.")
+
+        confidence_u = torch.div(
+            u * confidence_width,
+            source_width,
+            rounding_mode="floor",
+        )
+        confidence_v = torch.div(
+            v * confidence_height,
+            source_height,
+            rounding_mode="floor",
+        )
+        confidence_in_bounds = (
+            (confidence_u >= 0)
+            & (confidence_u < confidence_width)
+            & (confidence_v >= 0)
+            & (confidence_v < confidence_height)
+        )
+        if not bool(torch.all(confidence_in_bounds).item()):
+            raise ValueError("Mapped confidence coordinate is out of bounds.")
+        return (
+            confidence_u,
+            confidence_v,
+            source_width / confidence_width,
+            source_height / confidence_height,
+        )
+
     def _base_fields(
         self,
         *,
@@ -510,6 +565,11 @@ class GaussianCandidateSelectorV1:
             "confidence_is_current": None,
             "confidence_is_stale": None,
             "confidence_shape": None,
+            "confidence_sampling_method": CONFIDENCE_SAMPLING_METHOD,
+            "source_resolution": None,
+            "confidence_resolution": None,
+            "scale_x": None,
+            "scale_y": None,
             "confidence_dtype": None,
             "confidence_device": None,
             "confidence_requires_grad": None,
@@ -749,6 +809,7 @@ class GaussianCandidateSelectorV1:
                     xyz.dtype,
                 )
                 height, width = (int(source_depth.shape[0]), int(source_depth.shape[1]))
+                fields["source_resolution"] = [height, width]
                 if height != int(camera.image_height) or width != int(camera.image_width):
                     raise ValueError(
                         "Source depth/Camera image shape mismatch: "
@@ -785,6 +846,7 @@ class GaussianCandidateSelectorV1:
                 snapshot = self._confidence_snapshot_getter(
                     camera,
                     require_current=True,
+                    upsampled=False,
                 )
                 camera_buffer_index = getattr(camera, "buffer_index", None)
                 camera_source_frame_id = getattr(camera, "source_frame_id", None)
@@ -816,11 +878,19 @@ class GaussianCandidateSelectorV1:
                 confidence_map = getattr(snapshot, "confidence", None)
                 if not isinstance(confidence_map, torch.Tensor):
                     raise ValueError("Confidence snapshot contains no tensor.")
-                if tuple(confidence_map.shape) != (height, width):
+                if confidence_map.ndim != 2:
                     raise ValueError(
-                        "Confidence/source image shape mismatch: "
-                        f"confidence={tuple(confidence_map.shape)}, source={(height, width)}."
+                        "Confidence shape mismatch: expected 2 dimensions, "
+                        f"got {tuple(confidence_map.shape)}."
                     )
+                confidence_height, confidence_width = (
+                    int(confidence_map.shape[0]),
+                    int(confidence_map.shape[1]),
+                )
+                fields["confidence_resolution"] = [
+                    confidence_height,
+                    confidence_width,
+                ]
                 if confidence_map.device != xyz.device:
                     raise ValueError(
                         "Confidence/candidate device mismatch: "
@@ -838,7 +908,20 @@ class GaussianCandidateSelectorV1:
                     )
                 if not bool(torch.isfinite(confidence_map).all().item()):
                     raise ValueError("Confidence snapshot contains NaN or Inf.")
-                sampled_confidence = confidence_map[v, u]
+                confidence_u, confidence_v, scale_x, scale_y = (
+                    self.map_source_pixels_to_confidence(
+                        u,
+                        v,
+                        source_resolution=(height, width),
+                        confidence_resolution=(
+                            confidence_height,
+                            confidence_width,
+                        ),
+                    )
+                )
+                fields["scale_x"] = scale_x
+                fields["scale_y"] = scale_y
+                sampled_confidence = confidence_map[confidence_v, confidence_u]
                 confidence_finite = torch.isfinite(sampled_confidence)
                 valid_confidence = depth_consistent & confidence_finite
                 valid_count = int(torch.count_nonzero(valid_confidence).item())
@@ -905,6 +988,8 @@ class GaussianCandidateSelectorV1:
                     "eligible_indices": self._index_fingerprint(eligible_indices),
                     "u_index": self._index_fingerprint(u),
                     "v_index": self._index_fingerprint(v),
+                    "confidence_u_index": self._index_fingerprint(confidence_u),
+                    "confidence_v_index": self._index_fingerprint(confidence_v),
                     "voxel_inverse": self._index_fingerprint(candidate_inverse),
                 }
                 fields["candidate_ordering_fingerprint"] = self._fingerprint(ordering_components)

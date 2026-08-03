@@ -580,19 +580,27 @@ class GaussianMapper(object):
 
             self.new_cameras.append(cam)
 
-    def get_camera_confidence_snapshot(self, camera: Camera, require_current: bool = True):
+    def get_camera_confidence_snapshot(
+        self,
+        camera: Camera,
+        require_current: bool = True,
+        *,
+        upsampled: Optional[bool] = None,
+    ):
         """Return a provenance-checked clone for an explicit future confidence consumer.
 
         Existing mapping and all observer-off paths do not call this method.
         """
         if camera.buffer_index is None or camera.source_frame_id is None:
             raise ValueError("camera has no immutable DepthVideo frame identity.")
+        if upsampled is None:
+            upsampled = self.video.upsampled
         with self.slam.ba_lock:
             return self.video.get_confidence_snapshot(
                 index=camera.buffer_index,
                 expected_source_frame_id=camera.source_frame_id,
                 expected_timestamp=camera.source_timestamp,
-                upsampled=self.video.upsampled,
+                upsampled=upsampled,
                 require_current=require_current,
             )
 
