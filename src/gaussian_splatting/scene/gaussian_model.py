@@ -12,7 +12,7 @@ import os
 import ipdb
 import math
 from termcolor import colored
-from typing import Optional, List
+from typing import Optional, List, Union
 
 import numpy as np
 import open3d as o3d
@@ -29,6 +29,7 @@ from ...gaussian_candidate_observer import (
     collect_candidate_generation_metadata,
 )
 from ...candidate_selection import (
+    GaussianCandidateActiveTopKV1,
     GaussianCandidateSelectorDryRun,
     GaussianCandidateSelectorV1,
 )
@@ -588,18 +589,28 @@ class GaussianModel:
         downsample_factor=None,
         candidate_observer: Optional[GaussianCandidateObserver] = None,
         candidate_selector: Optional[GaussianCandidateSelectorDryRun] = None,
-        candidate_selector_v1: Optional[GaussianCandidateSelectorV1] = None,
+        candidate_selector_v1: Optional[
+            Union[GaussianCandidateSelectorV1, GaussianCandidateActiveTopKV1]
+        ] = None,
         mapper_update_id: Optional[int] = None,
     ):
         if candidate_selector is not None and candidate_observer is None:
             raise ValueError(
                 "candidate_selector requires candidate_observer to be active."
             )
-        if candidate_selector_v1 is not None and candidate_observer is None:
+        selector_v1_active = isinstance(
+            candidate_selector_v1,
+            GaussianCandidateActiveTopKV1,
+        )
+        if (
+            candidate_selector_v1 is not None
+            and candidate_observer is None
+            and not selector_v1_active
+        ):
             raise ValueError(
                 "candidate_selector_v1 requires candidate_observer to be active."
             )
-        if candidate_observer is None:
+        if candidate_observer is None and not selector_v1_active:
             features = self.create_pcd_from_image(
                 cam_info, init, scale=scale, depthmap=depthmap, mask=mask, downsample_factor=downsample_factor
             )
@@ -648,22 +659,48 @@ class GaussianModel:
                 )
 
             quality_token = None
+            active_selection = None
             if candidate_selector_v1 is not None:
-                quality_token = candidate_selector_v1.observe_before_extend(
-                    xyz=fused_point_cloud,
-                    features=features,
-                    scales=scales,
-                    rotations=rots,
-                    opacities=opacities,
-                    current_gaussian_xyz=self.get_xyz,
-                    camera=cam_info,
-                    depthmap=depthmap,
-                    depth_source=candidate_metadata.depth_source,
-                    mapper_update_id=mapper_update_id,
-                    init=init,
-                )
+                if selector_v1_active:
+                    active_selection = candidate_selector_v1.select_before_extend(
+                        xyz=fused_point_cloud,
+                        features=features,
+                        scales=scales,
+                        rotations=rots,
+                        opacities=opacities,
+                        camera=cam_info,
+                        depthmap=depthmap,
+                        depth_source=candidate_metadata.depth_source,
+                        mapper_update_id=mapper_update_id,
+                        init=init,
+                        gaussian_before=len(self),
+                    )
+                    fused_point_cloud = active_selection.xyz
+                    features = active_selection.features
+                    scales = active_selection.scales
+                    rots = active_selection.rotations
+                    opacities = active_selection.opacities
+                else:
+                    quality_token = candidate_selector_v1.observe_before_extend(
+                        xyz=fused_point_cloud,
+                        features=features,
+                        scales=scales,
+                        rotations=rots,
+                        opacities=opacities,
+                        current_gaussian_xyz=self.get_xyz,
+                        camera=cam_info,
+                        depthmap=depthmap,
+                        depth_source=candidate_metadata.depth_source,
+                        mapper_update_id=mapper_update_id,
+                        init=init,
+                    )
 
             # OURS-M01: Candidate admission hook before persistent Gaussian insertion.
+            if active_selection is not None and self.resource_admission is not None:
+                raise RuntimeError(
+                    "GCS-v1 active selection requires ResourceAdmission to be "
+                    "disabled; refusing a possible second selection."
+                )
             if self.resource_admission is None:
                 self.extend_from_pcd(fused_point_cloud, features, scales, rots, opacities, kf_id)
                 admitted_candidate_count = int(fused_point_cloud.shape[0])
@@ -711,12 +748,21 @@ class GaussianModel:
                     gaussian_after_extend=len(self),
                 )
             if candidate_selector_v1 is not None:
-                candidate_selector_v1.record_after_extend(
-                    quality_token,
-                    admitted_candidate_count=admitted_candidate_count,
-                    dropped_candidate_count=dropped_candidate_count,
-                    gaussian_after_extend=len(self),
-                )
+                if active_selection is not None:
+                    candidate_selector_v1.record_active_after_extend(
+                        active_selection.token,
+                        admitted_candidate_count=admitted_candidate_count,
+                        dropped_candidate_count=dropped_candidate_count,
+                        gaussian_after_extend=len(self),
+                        m01_second_selection_applied=False,
+                    )
+                else:
+                    candidate_selector_v1.record_after_extend(
+                        quality_token,
+                        admitted_candidate_count=admitted_candidate_count,
+                        dropped_candidate_count=dropped_candidate_count,
+                        gaussian_after_extend=len(self),
+                    )
         else:
             print("No points in the point cloud")
             if candidate_observer is not None:
@@ -747,18 +793,33 @@ class GaussianModel:
                     gaussian_after_extend=len(self),
                 )
             if candidate_selector_v1 is not None:
-                quality_token = candidate_selector_v1.observe_empty(
-                    current_gaussian_xyz=self.get_xyz,
-                    camera=cam_info,
-                    mapper_update_id=mapper_update_id,
-                    init=init,
-                )
-                candidate_selector_v1.record_after_extend(
-                    quality_token,
-                    admitted_candidate_count=0,
-                    dropped_candidate_count=0,
-                    gaussian_after_extend=len(self),
-                )
+                if selector_v1_active:
+                    active_token = candidate_selector_v1.observe_active_empty(
+                        camera=cam_info,
+                        mapper_update_id=mapper_update_id,
+                        init=init,
+                        gaussian_before=len(self),
+                    )
+                    candidate_selector_v1.record_active_after_extend(
+                        active_token,
+                        admitted_candidate_count=0,
+                        dropped_candidate_count=0,
+                        gaussian_after_extend=len(self),
+                        m01_second_selection_applied=False,
+                    )
+                else:
+                    quality_token = candidate_selector_v1.observe_empty(
+                        current_gaussian_xyz=self.get_xyz,
+                        camera=cam_info,
+                        mapper_update_id=mapper_update_id,
+                        init=init,
+                    )
+                    candidate_selector_v1.record_after_extend(
+                        quality_token,
+                        admitted_candidate_count=0,
+                        dropped_candidate_count=0,
+                        gaussian_after_extend=len(self),
+                    )
 
     def prune_points(self, mask):
         valid_points_mask = ~mask

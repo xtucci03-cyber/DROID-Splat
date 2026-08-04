@@ -1709,7 +1709,10 @@ class GaussianMapper(object):
         for cam in cameras:
             if not self.initialized:
                 self.initialized = True
-                if self.candidate_observer is None:
+                if (
+                    self.candidate_observer is None
+                    and self.candidate_selector_v1 is None
+                ):
                     self.gaussians.extend_from_pcd_seq(cam, cam.uid, init=True)
                 elif (
                     self.candidate_selector is None
@@ -1744,7 +1747,10 @@ class GaussianMapper(object):
                 self.info(f"Initialized with {len(self.gaussians)} gaussians for view {cam.uid}")
             else:
                 ng_before = len(self.gaussians)
-                if self.candidate_observer is None:
+                if (
+                    self.candidate_observer is None
+                    and self.candidate_selector_v1 is None
+                ):
                     self.gaussians.extend_from_pcd_seq(cam, cam.uid, init=False)
                 elif (
                     self.candidate_selector is None

@@ -82,6 +82,14 @@ candidate_selector:
   logging:
     enabled: true
 
+# Default-off GCS-v1. Observe retains every candidate; active applies the
+# frozen global Quality Top-k600 policy and requires M01/GCO to be off.
+candidate_selector_v1:
+  mode: "off"
+  budget: 600
+  logging:
+    enabled: true
+
 # Default-off historical-camera scheduling. Enabled configurations must keep
 # history_budget <= online_opt.n_rand_frames.
 camera_scheduler:

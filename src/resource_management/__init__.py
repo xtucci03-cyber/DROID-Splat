@@ -1,3 +1,11 @@
-from .m01_resource_admission import AdmissionResult, ResourceAdmission
+from .m01_resource_admission import (
+    AdmissionResult,
+    ResourceAdmission,
+    deterministic_uniform_indices,
+)
 
-__all__ = ["AdmissionResult", "ResourceAdmission"]
+__all__ = [
+    "AdmissionResult",
+    "ResourceAdmission",
+    "deterministic_uniform_indices",
+]

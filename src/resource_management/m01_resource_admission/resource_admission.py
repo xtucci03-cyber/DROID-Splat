@@ -10,6 +10,59 @@ import torch
 _MIB = 1024.0 * 1024.0
 
 
+def deterministic_uniform_indices(
+    *,
+    candidate_count: int,
+    fixed_budget: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Return the existing M01 deterministic-uniform candidate indices.
+
+    The result is a one-dimensional ``torch.long`` tensor on ``device``.
+    Empty inputs return an empty tensor, inputs within budget return every
+    original index, and over-budget inputs retain the original inclusive,
+    equally spaced floor rule.  The function never mutates an input tensor
+    and does not consume random state.
+    """
+
+    if isinstance(candidate_count, bool) or not isinstance(
+        candidate_count, Integral
+    ):
+        raise TypeError("candidate_count must be an integer and must not be bool.")
+    if candidate_count < 0:
+        raise ValueError("candidate_count must be greater than or equal to 0.")
+    if isinstance(fixed_budget, bool) or not isinstance(fixed_budget, Integral):
+        raise TypeError("fixed_budget must be an integer and must not be bool.")
+    if fixed_budget < 1:
+        raise ValueError("fixed_budget must be greater than or equal to 1.")
+
+    normalized_device = torch.device(device)
+    if candidate_count <= fixed_budget:
+        return torch.arange(
+            candidate_count,
+            dtype=torch.long,
+            device=normalized_device,
+        )
+    if fixed_budget == 1:
+        return torch.full(
+            (1,),
+            (candidate_count - 1) // 2,
+            dtype=torch.long,
+            device=normalized_device,
+        )
+
+    positions = torch.arange(
+        fixed_budget,
+        dtype=torch.long,
+        device=normalized_device,
+    )
+    return torch.div(
+        positions * (candidate_count - 1),
+        fixed_budget - 1,
+        rounding_mode="floor",
+    )
+
+
 @dataclass
 class AdmissionResult:
     xyz: torch.Tensor
@@ -140,23 +193,10 @@ class ResourceAdmission:
         fixed_budget: int,
         device: torch.device,
     ) -> torch.Tensor:
-        if fixed_budget == 1:
-            return torch.full(
-                (1,),
-                (candidate_count - 1) // 2,
-                dtype=torch.long,
-                device=device,
-            )
-
-        positions = torch.arange(
-            fixed_budget,
-            dtype=torch.long,
+        return deterministic_uniform_indices(
+            candidate_count=candidate_count,
+            fixed_budget=fixed_budget,
             device=device,
-        )
-        return torch.div(
-            positions * (candidate_count - 1),
-            fixed_budget - 1,
-            rounding_mode="floor",
         )
 
     def admit_before_extend(

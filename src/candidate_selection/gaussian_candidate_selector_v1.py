@@ -23,7 +23,8 @@ import torch
 LOG_PREFIX = "[GaussianCandidateSelectorV1]"
 SCHEMA_VERSION = 1
 MODE = "observe"
-SUPPORTED_MODES = frozenset({"off", MODE})
+ACTIVE_MODE = "active"
+SUPPORTED_MODES = frozenset({"off", MODE, ACTIVE_MODE})
 COVERAGE_METHOD = "voxel_occupancy"
 K_VALUES = (1, 2, 4, 8)
 COUNTERFACTUAL_SORT = (
@@ -31,7 +32,7 @@ COUNTERFACTUAL_SORT = (
 )
 CONFIDENCE_SAMPLING_METHOD = "lowres_cell_floor_v1"
 
-_TOP_LEVEL_FIELDS = frozenset({"mode", "logging"})
+_TOP_LEVEL_FIELDS = frozenset({"mode", "budget", "logging"})
 _LOGGING_FIELDS = frozenset({"enabled"})
 
 
@@ -98,7 +99,7 @@ def build_gaussian_candidate_selector_v1(
     resource_admission_mode: str,
     confidence_snapshot_getter: Callable[..., Any],
     device: Any,
-) -> Optional["GaussianCandidateSelectorV1"]:
+) -> Optional[Any]:
     """Build the observer, returning None without runtime state when off."""
 
     if config is None:
@@ -125,6 +126,23 @@ def build_gaussian_candidate_selector_v1(
     )
     if mode == "off":
         return None
+    if mode == ACTIVE_MODE:
+        from .gaussian_candidate_active_topk_v1 import (
+            build_gaussian_candidate_active_topk_v1,
+        )
+
+        return build_gaussian_candidate_active_topk_v1(
+            config,
+            candidate_observer=candidate_observer,
+            resource_admission_mode=resource_admission_mode,
+            confidence_snapshot_getter=confidence_snapshot_getter,
+            device=device,
+        )
+    budget = config.get("budget", 600)
+    if isinstance(budget, bool) or not isinstance(budget, int) or budget != 600:
+        raise ValueError(
+            "mapping.candidate_selector_v1.budget is frozen to integer 600."
+        )
     if not logging_enabled:
         raise ValueError(
             "mapping.candidate_selector_v1.logging.enabled must be true "
