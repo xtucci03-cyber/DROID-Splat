@@ -387,6 +387,15 @@ def _event_interval(event: Any) -> tuple[float, float]:
     return normalized_start, normalized_end
 
 
+def _interval_is_within(
+    event_interval: tuple[float, float],
+    scope_interval: tuple[float, float],
+) -> bool:
+    event_start, event_end = event_interval
+    scope_start, scope_end = scope_interval
+    return scope_start <= event_start and event_end <= scope_end
+
+
 def _sync_summary(events: list[Any]) -> dict[str, Any]:
     counts = {
         "aten::item": 0,
@@ -473,8 +482,6 @@ def _analyze_profile_events(profiler: Any) -> dict[str, Any]:
             )
         production_events = [event for event in events if id(event) in production_ids]
         harness_events = [event for event in events if id(event) in harness_ids]
-        production_summary = _sync_summary(production_events)
-        harness_summary = _sync_summary(harness_events)
 
         production_interval = _event_interval(production_scope)
         harness_interval = _event_interval(harness_scope)
@@ -500,6 +507,7 @@ def _analyze_profile_events(profiler: Any) -> dict[str, Any]:
             )
         infrastructure_events = []
         unattributed_events = []
+        unattributed_details = []
         excluded = production_ids | harness_ids | {
             id(production_scope),
             id(harness_scope),
@@ -510,19 +518,48 @@ def _analyze_profile_events(profiler: Any) -> dict[str, Any]:
             event_summary = _sync_summary([event])
             if event_summary["explicit_sync_total"] == 0:
                 continue
-            start, end = _event_interval(event)
-            if end <= production_interval[0] or start >= harness_interval[1]:
+            event_interval = _event_interval(event)
+            in_production = _interval_is_within(
+                event_interval, production_interval
+            )
+            in_harness = _interval_is_within(event_interval, harness_interval)
+            if in_production and in_harness:
+                unattributed_events.append(event)
+                unattributed_details.append(
+                    {
+                        "name": _event_name(event),
+                        "interval": event_interval,
+                        "reason": "contained_in_multiple_scopes",
+                    }
+                )
+            elif in_production:
+                production_events.append(event)
+            elif in_harness:
+                harness_events.append(event)
+            elif (
+                event_interval[1] <= production_interval[0]
+                or event_interval[0] >= harness_interval[1]
+            ):
                 infrastructure_events.append(event)
             else:
                 unattributed_events.append(event)
+                unattributed_details.append(
+                    {
+                        "name": _event_name(event),
+                        "interval": event_interval,
+                        "reason": "not_fully_contained_in_one_scope",
+                    }
+                )
 
+        production_summary = _sync_summary(production_events)
+        harness_summary = _sync_summary(harness_events)
         infrastructure_summary = _sync_summary(infrastructure_events)
         unattributed_summary = _sync_summary(unattributed_events)
         if unattributed_summary["explicit_sync_total"]:
             raise RuntimeError(
                 "Explicit synchronization events could not be attributed to "
                 "the production, harness-boundary, or profiler-infrastructure "
-                "scope."
+                f"scope: {unattributed_details!r}."
             )
     except SyncProfileBlocked:
         raise
