@@ -75,6 +75,7 @@ def _cuda_fixture(
     *,
     candidate_dtype: torch.dtype = torch.float32,
     requires_grad: bool = False,
+    intrinsics_kind: str = "python_float_intrinsics",
 ):
     depth = torch.ones(1, max(count, 1), dtype=candidate_dtype, device=CUDA_DEVICE)
     camera = ActiveCamera(depth)
@@ -83,6 +84,28 @@ def _cuda_fixture(
     camera.depth_prior = camera.depth_prior.to(
         device=CUDA_DEVICE, dtype=candidate_dtype
     )
+    if intrinsics_kind == "python_float_intrinsics":
+        pass
+    elif intrinsics_kind == "cpu_0d_tensor_intrinsics":
+        for name in ("fx", "fy", "cx", "cy"):
+            setattr(
+                camera,
+                name,
+                torch.tensor(getattr(camera, name), dtype=candidate_dtype),
+            )
+    elif intrinsics_kind == "cuda_0d_tensor_intrinsics":
+        for name in ("fx", "fy", "cx", "cy"):
+            setattr(
+                camera,
+                name,
+                torch.tensor(
+                    getattr(camera, name),
+                    dtype=candidate_dtype,
+                    device=CUDA_DEVICE,
+                ),
+            )
+    else:
+        raise ValueError(f"Unknown intrinsics_kind={intrinsics_kind!r}.")
     if scores is None:
         scores = torch.arange(
             max(count, 1), dtype=candidate_dtype, device=CUDA_DEVICE
@@ -183,6 +206,163 @@ class StableCudaArgsortTests(CudaGateTestCase):
         )
         torch.cuda.synchronize(CUDA_DEVICE)
         self.assertEqual(selected.cpu().tolist(), _reference_winners(scores, 3))
+
+
+class IntrinsicsCudaContractTests(CudaGateTestCase):
+    @staticmethod
+    def _profile_events(operation):
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            record_shapes=True,
+            profile_memory=True,
+        ) as profiler:
+            result = operation()
+        torch.cuda.synchronize(CUDA_DEVICE)
+        return result, list(profiler.events())
+
+    def test_cuda_0d_intrinsics_match_oracle_and_five_fields(self):
+        scores = torch.ones(601, dtype=torch.float64, device=CUDA_DEVICE)
+        selector, _, camera, candidates = _cuda_fixture(
+            601,
+            scores,
+            candidate_dtype=torch.float64,
+            intrinsics_kind="cuda_0d_tensor_intrinsics",
+        )
+        result = _select(selector, camera, candidates)
+        expected = torch.arange(600, dtype=torch.long, device=CUDA_DEVICE)
+        self.assertTrue(torch.equal(result.selected_indices, expected))
+        self.assertEqual(_reference_winners(scores), expected.cpu().tolist())
+        for name in ("fx", "fy", "cx", "cy"):
+            value = getattr(camera, name)
+            self.assertEqual(value.ndim, 0)
+            self.assertEqual(value.device, CUDA_DEVICE)
+            self.assertEqual(value.dtype, torch.float64)
+        for original, output in zip(candidates, _outputs(result)):
+            self.assertTrue(torch.equal(output, original.index_select(0, expected)))
+            self.assertEqual(output.device, CUDA_DEVICE)
+            self.assertEqual(output.dtype, original.dtype)
+
+    def test_cuda_0d_intrinsics_invalid_values_and_pose_priority(self):
+        cases = (
+            ("fx", torch.nan, "Camera fx must be one finite scalar"),
+            ("fy", torch.inf, "Camera fy must be one finite scalar"),
+            ("fx", 0.0, "Camera fx and fy must be positive"),
+            ("fy", -1.0, "Camera fx and fy must be positive"),
+        )
+        for name, value, message in cases:
+            with self.subTest(name=name, value=value):
+                selector, _, camera, candidates = _cuda_fixture(
+                    601,
+                    intrinsics_kind="cuda_0d_tensor_intrinsics",
+                )
+                getattr(camera, name).fill_(value)
+                result = _select(selector, camera, candidates)
+                fallback = result.token.fields["fallback_reason"]
+                self.assertEqual(fallback["code"], "invalid_camera_projection")
+                self.assertIn(message, fallback["error"]["message"])
+
+        selector, _, camera, candidates = _cuda_fixture(
+            601,
+            intrinsics_kind="cuda_0d_tensor_intrinsics",
+        )
+        camera._pose[0, 0] = torch.nan
+        camera.fx.fill_(torch.nan)
+        result = _select(selector, camera, candidates)
+        self.assertIn(
+            "W2C pose contains NaN or Inf",
+            result.token.fields["fallback_reason"]["error"]["message"],
+        )
+
+    def test_mixed_cuda_cpu_and_python_intrinsics_remain_supported(self):
+        selector, _, camera, candidates = _cuda_fixture(
+            601,
+            intrinsics_kind="cuda_0d_tensor_intrinsics",
+        )
+        camera.fy = camera.fy.cpu()
+        camera.cx = 0.0
+        result = _select(selector, camera, candidates)
+        expected = torch.arange(1, 601, dtype=torch.long, device=CUDA_DEVICE)
+        self.assertTrue(torch.equal(result.selected_indices, expected))
+        self.assertEqual(result.token.fields["selector"], "quality_topk")
+
+    def test_cuda_intrinsics_path_has_no_host_copy(self):
+        selector, _, camera, _ = _cuda_fixture(
+            601,
+            intrinsics_kind="cuda_0d_tensor_intrinsics",
+        )
+        (intrinsics, host_values), events = self._profile_events(
+            lambda: selector._camera_intrinsics(
+                camera,
+                CUDA_DEVICE,
+                torch.float32,
+            )
+        )
+        self.assertIsNone(host_values)
+        self.assertEqual(tuple(intrinsics.shape), (4,))
+        self.assertEqual(intrinsics.device, CUDA_DEVICE)
+        event_names = [str(event.name) for event in events]
+        self.assertFalse(any("DtoH" in name for name in event_names), event_names)
+        self.assertFalse(any(name == "aten::_to_copy" for name in event_names))
+
+    def test_cpu_0d_intrinsics_use_one_vector_h2d(self):
+        selector, _, camera, _ = _cuda_fixture(
+            601,
+            intrinsics_kind="cpu_0d_tensor_intrinsics",
+        )
+        (intrinsics, host_values), events = self._profile_events(
+            lambda: selector._camera_intrinsics(
+                camera,
+                CUDA_DEVICE,
+                torch.float32,
+            )
+        )
+        self.assertEqual(host_values, (1.0, 1.0, 0.0, 0.0))
+        self.assertEqual(tuple(intrinsics.shape), (4,))
+        self.assertEqual(intrinsics.device, CUDA_DEVICE)
+        to_copy_events = [
+            event for event in events if str(event.name) == "aten::_to_copy"
+        ]
+        vector_copies = [
+            event
+            for event in to_copy_events
+            if event.input_shapes and event.input_shapes[0] == [4]
+        ]
+        scalar_copies = [
+            event
+            for event in to_copy_events
+            if event.input_shapes and event.input_shapes[0] == []
+        ]
+        transfer_bytes = intrinsics.numel() * intrinsics.element_size()
+        print(
+            "CPU_INTRINSICS_H2D_PROFILE "
+            + json.dumps(
+                {
+                    "vector_to_copy_events": len(vector_copies),
+                    "scalar_to_copy_events": len(scalar_copies),
+                    "input_shape": list(intrinsics.shape),
+                    "expected_transfer_bytes": transfer_bytes,
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        self.assertEqual(
+            len(vector_copies),
+            1,
+            [event.input_shapes for event in to_copy_events],
+        )
+        self.assertEqual(
+            len(scalar_copies),
+            0,
+            [event.input_shapes for event in to_copy_events],
+        )
+        self.assertEqual(
+            transfer_bytes,
+            4 * torch.empty((), dtype=torch.float32).element_size(),
+        )
 
 
 class BypassAndFastPathCudaTests(CudaGateTestCase):

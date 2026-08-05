@@ -534,6 +534,228 @@ class ActiveSelectorIntegrationTests(unittest.TestCase):
         self.assertEqual(result.token.fields["evidence_frame_id"], 7001)
         self.assertEqual(result.token.fields["confidence_version"], 9)
 
+    def test_tensor_intrinsics_match_host_scalar_output_contract(self):
+        scores = torch.linspace(-2.0, 3.0, 603, dtype=torch.float32)
+        host_selector, _, host_camera, candidates = make_active_fixture(603, scores)
+        tensor_selector, _, tensor_camera, _ = make_active_fixture(603, scores)
+        tensor_camera.fx = torch.tensor(host_camera.fx)
+        tensor_camera.fy = torch.tensor(host_camera.fy)
+        tensor_camera.cx = torch.tensor(host_camera.cx)
+        tensor_camera.cy = torch.tensor(host_camera.cy)
+
+        host_result = select_active(host_selector, host_camera, candidates)
+        tensor_result = select_active(tensor_selector, tensor_camera, candidates)
+
+        self.assertTrue(
+            torch.equal(host_result.selected_indices, tensor_result.selected_indices)
+        )
+        for host_output, tensor_output in zip(
+            (
+                host_result.xyz,
+                host_result.features,
+                host_result.scales,
+                host_result.rotations,
+                host_result.opacities,
+            ),
+            (
+                tensor_result.xyz,
+                tensor_result.features,
+                tensor_result.scales,
+                tensor_result.rotations,
+                tensor_result.opacities,
+            ),
+        ):
+            self.assertTrue(torch.equal(host_output, tensor_output))
+            self.assertEqual(host_output.dtype, tensor_output.dtype)
+            self.assertEqual(host_output.device, tensor_output.device)
+        for field in (
+            "reason",
+            "selector",
+            "confidence_min",
+            "confidence_max",
+            "selected_indices_fingerprint",
+            "source_resolution",
+            "confidence_resolution",
+            "scale_x",
+            "scale_y",
+        ):
+            self.assertEqual(
+                host_result.token.fields[field],
+                tensor_result.token.fields[field],
+                field,
+            )
+
+    def test_cpu_tensor_intrinsics_are_batched_before_one_transfer(self):
+        original_to = torch.Tensor.to
+        for tensor_fields in (
+            ("fx", "fy", "cx", "cy"),
+            ("fx", "cx"),
+        ):
+            with self.subTest(tensor_fields=tensor_fields):
+                selector, _, camera, _ = make_active_fixture(603)
+                for name in tensor_fields:
+                    setattr(camera, name, torch.tensor(getattr(camera, name)))
+                transfer_shapes = []
+
+                def record_to(tensor, *args, **kwargs):
+                    transfer_shapes.append(tuple(tensor.shape))
+                    return original_to(tensor, *args, **kwargs)
+
+                with mock.patch.object(torch.Tensor, "to", new=record_to):
+                    intrinsics, normalized = selector._camera_intrinsics(
+                        camera,
+                        torch.device("cpu"),
+                        torch.float32,
+                    )
+                self.assertEqual(transfer_shapes, [(4,)])
+                self.assertEqual(tuple(intrinsics.shape), (4,))
+                self.assertEqual(intrinsics.dtype, torch.float32)
+                self.assertEqual(intrinsics.device.type, "cpu")
+                self.assertEqual(normalized, (1.0, 1.0, 0.0, 0.0))
+
+    def test_projection_error_priority_and_intrinsic_messages_are_preserved(self):
+        selector, getter, camera, candidates = make_active_fixture(603)
+        camera._pose[0, 0] = torch.nan
+        camera.fx = torch.tensor(torch.nan)
+        result = select_active(selector, camera, candidates)
+        fallback_error = result.token.fields["fallback_reason"]["error"]
+        self.assertEqual(
+            result.token.fields["fallback_reason"]["code"],
+            "invalid_camera_projection",
+        )
+        self.assertIn("W2C pose contains NaN or Inf", fallback_error["message"])
+
+        cases = (
+            ("fx", torch.tensor(torch.nan), "Camera fx must be one finite scalar"),
+            ("fy", torch.tensor(torch.inf), "Camera fy must be one finite scalar"),
+            ("cx", 1.0e100, "Camera cx must be one finite scalar"),
+            (
+                "cx",
+                torch.tensor(1.0e100, dtype=torch.float64),
+                "Camera cx must be one finite scalar",
+            ),
+            ("fx", torch.tensor(0.0), "Camera fx and fy must be positive"),
+            ("fy", torch.tensor(-1.0), "Camera fx and fy must be positive"),
+        )
+        for field, value, message in cases:
+            with self.subTest(field=field, value=value):
+                selector, _, camera, candidates = make_active_fixture(603)
+                setattr(camera, field, value)
+                result = select_active(selector, camera, candidates)
+                fallback = result.token.fields["fallback_reason"]
+                self.assertEqual(fallback["code"], "invalid_camera_projection")
+                self.assertIn(message, fallback["error"]["message"])
+
+    def test_projection_and_depth_lineage_reasons_remain_distinct(self):
+        selector, getter, camera, candidates = make_active_fixture(603)
+        invalid_projection = list(candidates)
+        invalid_projection[0] = invalid_projection[0].clone()
+        invalid_projection[0][10, 0] = 10_000.0
+        camera.depth.fill_(torch.nan)
+        result = select_active(selector, camera, tuple(invalid_projection))
+        self.assertEqual(
+            result.token.fields["fallback_reason"]["code"],
+            "invalid_candidate_projection",
+        )
+        self.assertEqual(getter.calls, 0)
+
+    def test_composite_contract_errors_preserve_pre_sampling_priority(self):
+        selector, _, _, _ = make_active_fixture(603)
+        with self.assertRaisesRegex(
+            ActiveConfidenceEvidenceError,
+            "Source pixel coordinate is out of bounds",
+        ) as source_error:
+            selector.map_source_pixels_to_confidence(
+                torch.tensor([-1], dtype=torch.long),
+                torch.tensor([-1], dtype=torch.long),
+                source_resolution=(1, 603),
+                confidence_resolution=(1, 76),
+            )
+        self.assertEqual(
+            source_error.exception.reason,
+            "invalid_candidate_projection",
+        )
+
+        selector, getter, camera, candidates = make_active_fixture(603)
+        getter.confidence = torch.full((1, 1, 603), torch.nan)
+        result = select_active(selector, camera, candidates)
+        self.assertEqual(
+            result.token.fields["fallback_reason"]["code"],
+            "confidence_shape_mismatch",
+        )
+        self.assertEqual(getter.calls, 1)
+
+        selector, getter, camera, candidates = make_active_fixture(603)
+        getter.confidence = torch.full((1, 603), torch.nan)
+        getter.overrides["shape"] = (2, 2)
+        result = select_active(selector, camera, candidates)
+        self.assertEqual(
+            result.token.fields["fallback_reason"]["code"],
+            "confidence_shape_mismatch",
+        )
+        self.assertEqual(getter.calls, 1)
+
+        selector, getter, camera, candidates = make_active_fixture(603)
+        camera.depth[0, 10] = 2.0
+        result = select_active(selector, camera, candidates)
+        self.assertEqual(
+            result.token.fields["fallback_reason"]["code"],
+            "source_depth_lineage_mismatch",
+        )
+        self.assertEqual(getter.calls, 0)
+
+    def test_remaining_evidence_reasons_are_individually_preserved(self):
+        pre_snapshot_cases = (
+            (
+                lambda camera: setattr(camera, "depth", None),
+                "source_depth_unavailable",
+            ),
+            (
+                lambda camera: setattr(camera, "depth", torch.ones(1, 1, 603)),
+                "source_depth_shape_mismatch",
+            ),
+            (
+                lambda camera: setattr(camera, "image_width", 602),
+                "source_depth_camera_shape_mismatch",
+            ),
+        )
+        for mutate, reason in pre_snapshot_cases:
+            with self.subTest(reason=reason):
+                selector, getter, camera, candidates = make_active_fixture(603)
+                mutate(camera)
+                result = select_active(selector, camera, candidates)
+                self.assertEqual(
+                    result.token.fields["fallback_reason"]["code"], reason
+                )
+                self.assertEqual(getter.calls, 0)
+
+        selector, getter, camera, candidates = make_active_fixture(603)
+        getter.overrides["requires_grad"] = True
+        result = select_active(selector, camera, candidates)
+        self.assertEqual(
+            result.token.fields["fallback_reason"]["code"],
+            "confidence_requires_grad_mismatch",
+        )
+        self.assertEqual(getter.calls, 1)
+
+    def test_frozen_stats_and_index_fingerprint_oracle(self):
+        confidence = torch.tensor([0.25, 2.0, -1.0, 2.0, 0.5])
+        selected = stable_quality_topk_indices(
+            confidence,
+            candidate_count=5,
+            requested_k=3,
+            device=torch.device("cpu"),
+        )
+        self.assertEqual(selected.tolist(), [1, 3, 4])
+        self.assertEqual(
+            GaussianCandidateActiveTopKV1._index_fingerprint(selected),
+            "b57d388ec12a54bbbbc0674b41236008b8e0f399df88a77d057f0998afd98d21",
+        )
+        self.assertEqual(
+            GaussianCandidateActiveTopKV1._stats(confidence),
+            {"count": 5, "min": -1.0, "max": 2.0, "mean": 0.75},
+        )
+
     def test_all_equal_selects_first_600_deterministically(self):
         selector, _, camera, candidates = make_active_fixture(603, torch.ones(603))
         first = select_active(selector, camera, candidates)

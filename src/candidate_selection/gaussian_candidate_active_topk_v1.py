@@ -127,6 +127,23 @@ class ActiveConfidenceEvidenceError(ValueError):
         self.reason = reason
 
 
+def _read_boolean_statuses(*checks: torch.Tensor) -> tuple[bool, ...]:
+    """Read a small, ordered set of scalar CUDA predicates once."""
+
+    if not checks:
+        return ()
+    for check in checks:
+        if not isinstance(check, torch.Tensor) or check.numel() != 1:
+            raise RuntimeError("Active status checks must be scalar tensors.")
+        if check.dtype != torch.bool:
+            raise RuntimeError("Active status checks must have bool dtype.")
+    devices = {check.device for check in checks}
+    if len(devices) != 1:
+        raise RuntimeError("Active status checks must share one device.")
+    values = torch.stack(tuple(check.reshape(()) for check in checks))
+    return tuple(bool(value) for value in values.detach().cpu().tolist())
+
+
 def _known_snapshot_failure(error: BaseException) -> Optional[str]:
     """Classify only known snapshot/provenance failures; unknowns propagate."""
 
@@ -197,7 +214,10 @@ def stable_quality_topk_indices(
             "Confidence dtype mismatch: expected floating point, got "
             f"{confidence.dtype}.",
         )
-    if not bool(torch.isfinite(confidence).all().item()):
+    (confidence_is_finite,) = _read_boolean_statuses(
+        torch.isfinite(confidence).all()
+    )
+    if not confidence_is_finite:
         raise ActiveConfidenceEvidenceError(
             "nonfinite_confidence",
             "Confidence contains NaN or Inf.",
@@ -468,19 +488,72 @@ class GaussianCandidateActiveTopKV1:
         }
 
     @staticmethod
-    def _camera_scalar(
-        value: Any,
-        name: str,
+    def _camera_intrinsics(
+        camera: Any,
         device: torch.device,
         dtype: torch.dtype,
-    ) -> torch.Tensor:
-        scalar = torch.as_tensor(value, device=device, dtype=dtype)
-        if scalar.numel() != 1 or not bool(torch.isfinite(scalar).item()):
-            raise ActiveConfidenceEvidenceError(
-                "invalid_camera_projection",
-                f"Camera {name} must be one finite scalar.",
+    ) -> tuple[torch.Tensor, Optional[tuple[float, float, float, float]]]:
+        values = (camera.fx, camera.fy, camera.cx, camera.cy)
+        names = ("fx", "fy", "cx", "cy")
+        has_non_cpu_tensor = any(
+            isinstance(value, torch.Tensor) and value.device.type != "cpu"
+            for value in values
+        )
+
+        if not has_non_cpu_tensor:
+            cpu_scalars = []
+            for value, name in zip(values, names):
+                if isinstance(value, torch.Tensor):
+                    if value.numel() != 1:
+                        raise ActiveConfidenceEvidenceError(
+                            "invalid_camera_projection",
+                            f"Camera {name} must be one finite scalar.",
+                        )
+                    scalar = torch.as_tensor(
+                        value.detach(),
+                        device="cpu",
+                        dtype=dtype,
+                    ).reshape(())
+                else:
+                    try:
+                        numeric = float(value)
+                    except (TypeError, ValueError, OverflowError) as error:
+                        raise ActiveConfidenceEvidenceError(
+                            "invalid_camera_projection",
+                            f"Camera {name} must be one finite scalar.",
+                        ) from error
+                    scalar = torch.tensor(numeric, device="cpu", dtype=dtype)
+                cpu_scalars.append(scalar)
+            cpu_intrinsics = torch.stack(cpu_scalars)
+            normalized_values = tuple(
+                float(value) for value in cpu_intrinsics.tolist()
             )
-        return scalar.reshape(())
+            for value, name in zip(normalized_values, names):
+                if not math.isfinite(value):
+                    raise ActiveConfidenceEvidenceError(
+                        "invalid_camera_projection",
+                        f"Camera {name} must be one finite scalar.",
+                    )
+            if normalized_values[0] <= 0 or normalized_values[1] <= 0:
+                raise ActiveConfidenceEvidenceError(
+                    "invalid_camera_projection",
+                    "Camera fx and fy must be positive.",
+                )
+            return (
+                cpu_intrinsics.to(device=device),
+                normalized_values,
+            )
+
+        scalars = []
+        for value, name in zip(values, names):
+            scalar = torch.as_tensor(value, device=device, dtype=dtype)
+            if scalar.numel() != 1:
+                raise ActiveConfidenceEvidenceError(
+                    "invalid_camera_projection",
+                    f"Camera {name} must be one finite scalar.",
+                )
+            scalars.append(scalar.reshape(()))
+        return torch.stack(scalars), None
 
     @staticmethod
     def _source_depth(
@@ -536,24 +609,48 @@ class GaussianCandidateActiveTopKV1:
                 "Camera pose must be a [4,4] W2C tensor.",
             )
         pose_w2c = pose_w2c.detach().to(device=xyz.device, dtype=xyz.dtype)
-        if not bool(torch.isfinite(pose_w2c).all().item()):
+        (pose_is_finite,) = _read_boolean_statuses(
+            torch.isfinite(pose_w2c).all()
+        )
+        if not pose_is_finite:
             raise ActiveConfidenceEvidenceError(
                 "invalid_camera_projection",
                 "Camera W2C pose contains NaN or Inf.",
+            )
+        intrinsics, host_intrinsics = self._camera_intrinsics(
+            camera,
+            xyz.device,
+            xyz.dtype,
+        )
+        if host_intrinsics is not None:
+            intrinsic_finite_values = (True, True, True, True)
+            focal_lengths_are_positive = True
+        else:
+            statuses = _read_boolean_statuses(
+                *(torch.isfinite(value) for value in intrinsics.unbind()),
+                (intrinsics[:2] > 0).all(),
+            )
+            intrinsic_finite_values = statuses[:4]
+            focal_lengths_are_positive = statuses[4]
+        for is_finite, name in zip(
+            intrinsic_finite_values,
+            ("fx", "fy", "cx", "cy"),
+        ):
+            if not is_finite:
+                raise ActiveConfidenceEvidenceError(
+                    "invalid_camera_projection",
+                    f"Camera {name} must be one finite scalar.",
+                )
+        if not focal_lengths_are_positive:
+            raise ActiveConfidenceEvidenceError(
+                "invalid_camera_projection",
+                "Camera fx and fy must be positive.",
             )
         camera_xyz = xyz @ pose_w2c[:3, :3].transpose(0, 1) + pose_w2c[:3, 3]
         z = camera_xyz[:, 2]
         projection_finite = torch.isfinite(camera_xyz).all(dim=1)
         positive_z = z > 0
-        fx = self._camera_scalar(camera.fx, "fx", xyz.device, xyz.dtype)
-        fy = self._camera_scalar(camera.fy, "fy", xyz.device, xyz.dtype)
-        cx = self._camera_scalar(camera.cx, "cx", xyz.device, xyz.dtype)
-        cy = self._camera_scalar(camera.cy, "cy", xyz.device, xyz.dtype)
-        if bool((fx <= 0).item()) or bool((fy <= 0).item()):
-            raise ActiveConfidenceEvidenceError(
-                "invalid_camera_projection",
-                "Camera fx and fy must be positive.",
-            )
+        fx, fy, cx, cy = intrinsics.unbind()
         safe_z = torch.where(positive_z, z, torch.ones_like(z))
         u_float = fx * camera_xyz[:, 0] / safe_z + cx
         v_float = fy * camera_xyz[:, 1] / safe_z + cy
@@ -598,11 +695,6 @@ class GaussianCandidateActiveTopKV1:
             & (v >= 0)
             & (v < source_height)
         )
-        if not bool(torch.all(source_in_bounds).item()):
-            raise ActiveConfidenceEvidenceError(
-                "invalid_candidate_projection",
-                "Source pixel coordinate is out of bounds.",
-            )
         confidence_u = torch.div(
             u * confidence_width,
             source_width,
@@ -619,7 +711,16 @@ class GaussianCandidateActiveTopKV1:
             & (confidence_v >= 0)
             & (confidence_v < confidence_height)
         )
-        if not bool(torch.all(confidence_in_bounds).item()):
+        source_bounds_valid, confidence_bounds_valid = _read_boolean_statuses(
+            torch.all(source_in_bounds),
+            torch.all(confidence_in_bounds),
+        )
+        if not source_bounds_valid:
+            raise ActiveConfidenceEvidenceError(
+                "invalid_candidate_projection",
+                "Source pixel coordinate is out of bounds.",
+            )
+        if not confidence_bounds_valid:
             raise ActiveConfidenceEvidenceError(
                 "confidence_shape_mismatch",
                 "Mapped confidence coordinate is out of bounds.",
@@ -671,7 +772,10 @@ class GaussianCandidateActiveTopKV1:
             & (v >= 0)
             & (v < height)
         )
-        if not bool(torch.all(in_bounds).item()):
+        (candidate_projection_is_valid,) = _read_boolean_statuses(
+            torch.all(in_bounds)
+        )
+        if not candidate_projection_is_valid:
             raise ActiveConfidenceEvidenceError(
                 "invalid_candidate_projection",
                 "Candidate source projection is invalid or out of bounds.",
@@ -680,7 +784,10 @@ class GaussianCandidateActiveTopKV1:
         depth_valid = torch.isfinite(sampled_depth) & (sampled_depth > 0)
         depth_error = torch.abs(sampled_depth - z)
         depth_tolerance = 1.0e-3 + 1.0e-3 * torch.abs(z)
-        if not bool(torch.all(depth_valid & (depth_error <= depth_tolerance)).item()):
+        (depth_lineage_is_valid,) = _read_boolean_statuses(
+            torch.all(depth_valid & (depth_error <= depth_tolerance))
+        )
+        if not depth_lineage_is_valid:
             raise ActiveConfidenceEvidenceError(
                 "source_depth_lineage_mismatch",
                 "Candidate source depth lineage is invalid or inconsistent.",
@@ -772,7 +879,10 @@ class GaussianCandidateActiveTopKV1:
                 "confidence_requires_grad_mismatch",
                 "Confidence snapshot requires_grad metadata mismatch.",
             )
-        if not bool(torch.isfinite(confidence_map).all().item()):
+        (confidence_map_is_finite,) = _read_boolean_statuses(
+            torch.isfinite(confidence_map).all()
+        )
+        if not confidence_map_is_finite:
             raise ActiveConfidenceEvidenceError(
                 "nonfinite_confidence",
                 "Confidence snapshot contains NaN or Inf.",
