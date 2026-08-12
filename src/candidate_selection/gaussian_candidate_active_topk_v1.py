@@ -1011,7 +1011,10 @@ class GaussianCandidateActiveTopKV1:
         mapper_update_id: int,
         init: bool,
         gaussian_before: int,
+        preinsert_render_evidence: Any = None,
     ) -> CandidateActiveSelectionResult:
+        # Reserved for GCS-v2.  Active v1 deliberately does not read render
+        # values, so confidence ranking and selected indices remain frozen.
         started_ns = time.perf_counter_ns()
         candidate_count, tensors = self._validate_active_candidate_contract(
             xyz=xyz,

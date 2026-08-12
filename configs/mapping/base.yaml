@@ -90,6 +90,11 @@ candidate_selector_v1:
   logging:
     enabled: true
 
+# Default-off, observe-only old-map render evidence for future GCS-v2.
+# Observe adds one no-grad render before each non-init candidate event.
+preinsert_render_evidence_v1:
+  mode: "off"
+
 # Default-off historical-camera scheduling. Enabled configurations must keep
 # history_budget <= online_opt.n_rand_frames.
 camera_scheduler:

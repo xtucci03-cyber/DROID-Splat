@@ -32,6 +32,7 @@ from ...candidate_selection import (
     GaussianCandidateActiveTopKV1,
     GaussianCandidateSelectorDryRun,
     GaussianCandidateSelectorV1,
+    PreinsertRenderEvidenceV1,
 )
 from ..utils.general_utils import (
     build_rotation,
@@ -593,7 +594,14 @@ class GaussianModel:
             Union[GaussianCandidateSelectorV1, GaussianCandidateActiveTopKV1]
         ] = None,
         mapper_update_id: Optional[int] = None,
+        preinsert_render_evidence: Optional[PreinsertRenderEvidenceV1] = None,
     ):
+        if preinsert_render_evidence is not None:
+            preinsert_render_evidence.validate_for_event(
+                camera=cam_info,
+                gaussian_count_current=len(self),
+                mapper_update_id=mapper_update_id,
+            )
         if candidate_selector is not None and candidate_observer is None:
             raise ValueError(
                 "candidate_selector requires candidate_observer to be active."
@@ -674,6 +682,7 @@ class GaussianModel:
                         mapper_update_id=mapper_update_id,
                         init=init,
                         gaussian_before=len(self),
+                        preinsert_render_evidence=preinsert_render_evidence,
                     )
                     fused_point_cloud = active_selection.xyz
                     features = active_selection.features

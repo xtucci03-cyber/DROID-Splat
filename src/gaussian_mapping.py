@@ -29,6 +29,7 @@ from .camera_scheduling import build_historical_camera_scheduler
 from .candidate_selection import (
     build_gaussian_candidate_selector,
     build_gaussian_candidate_selector_v1,
+    build_preinsert_render_evidence_v1,
 )
 from .gaussian_candidate_observer import build_gaussian_candidate_observer
 from .mapping_activity_observer import MappingActivityObserver
@@ -142,6 +143,10 @@ class GaussianMapper(object):
             candidate_observer=self.candidate_observer,
             resource_admission_mode=resource_admission_mode,
             confidence_snapshot_getter=self.get_camera_confidence_snapshot,
+            device=self.device,
+        )
+        self.preinsert_render_evidence_v1 = build_preinsert_render_evidence_v1(
+            cfg.mapping.get("preinsert_render_evidence_v1", None),
             device=self.device,
         )
 
@@ -1700,6 +1705,27 @@ class GaussianMapper(object):
                 reason="mapping_queue_unavailable",
             )
 
+    def _capture_preinsert_render_evidence(self, cam: Camera, *, init: bool):
+        observer = self.preinsert_render_evidence_v1
+        if observer is None:
+            return None
+        gaussian_count = len(self.gaussians)
+        if init:
+            return observer.unavailable(
+                camera=cam,
+                gaussian_count_before_render=gaussian_count,
+                mapper_update_id=self.count,
+                reason="init_bypass",
+            )
+        return observer.capture(
+            camera=cam,
+            gaussians=self.gaussians,
+            renderer=render,
+            pipeline_params=self.pipeline_params,
+            background=self.background,
+            mapper_update_id=self.count,
+        )
+
     def add_new_gaussians(self, cameras: List[Camera]) -> Camera | None:
         """Initialize new Gaussians based on the provided views (images, poses (, depth))"""
         # Sanity check
@@ -1707,11 +1733,16 @@ class GaussianMapper(object):
             return None
 
         for cam in cameras:
+            preinsert_render_evidence = self._capture_preinsert_render_evidence(
+                cam,
+                init=not self.initialized,
+            )
             if not self.initialized:
                 self.initialized = True
                 if (
                     self.candidate_observer is None
                     and self.candidate_selector_v1 is None
+                    and preinsert_render_evidence is None
                 ):
                     self.gaussians.extend_from_pcd_seq(cam, cam.uid, init=True)
                 elif (
@@ -1724,6 +1755,7 @@ class GaussianMapper(object):
                         init=True,
                         candidate_observer=self.candidate_observer,
                         mapper_update_id=self.count,
+                        preinsert_render_evidence=preinsert_render_evidence,
                     )
                 else:
                     candidate_diagnostics = {
@@ -1737,6 +1769,10 @@ class GaussianMapper(object):
                     if self.candidate_selector_v1 is not None:
                         candidate_diagnostics["candidate_selector_v1"] = (
                             self.candidate_selector_v1
+                        )
+                    if preinsert_render_evidence is not None:
+                        candidate_diagnostics["preinsert_render_evidence"] = (
+                            preinsert_render_evidence
                         )
                     self.gaussians.extend_from_pcd_seq(
                         cam,
@@ -1750,6 +1786,7 @@ class GaussianMapper(object):
                 if (
                     self.candidate_observer is None
                     and self.candidate_selector_v1 is None
+                    and preinsert_render_evidence is None
                 ):
                     self.gaussians.extend_from_pcd_seq(cam, cam.uid, init=False)
                 elif (
@@ -1762,6 +1799,7 @@ class GaussianMapper(object):
                         init=False,
                         candidate_observer=self.candidate_observer,
                         mapper_update_id=self.count,
+                        preinsert_render_evidence=preinsert_render_evidence,
                     )
                 else:
                     candidate_diagnostics = {
@@ -1776,12 +1814,18 @@ class GaussianMapper(object):
                         candidate_diagnostics["candidate_selector_v1"] = (
                             self.candidate_selector_v1
                         )
+                    if preinsert_render_evidence is not None:
+                        candidate_diagnostics["preinsert_render_evidence"] = (
+                            preinsert_render_evidence
+                        )
                     self.gaussians.extend_from_pcd_seq(
                         cam,
                         cam.uid,
                         init=False,
                         **candidate_diagnostics,
                     )
+            # The large render tensors are event-local and are never cached.
+            preinsert_render_evidence = None
 
         return cam
 

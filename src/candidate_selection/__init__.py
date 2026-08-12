@@ -19,6 +19,12 @@ from .gaussian_candidate_selector_v1 import (
     GaussianCandidateSelectorV1,
     build_gaussian_candidate_selector_v1,
 )
+from .preinsert_render_evidence_v1 import (
+    PreinsertRenderEvidenceError,
+    PreinsertRenderEvidenceObserverV1,
+    PreinsertRenderEvidenceV1,
+    build_preinsert_render_evidence_v1,
+)
 
 __all__ = [
     "CandidateSelectorDryRunSummary",
@@ -34,4 +40,8 @@ __all__ = [
     "GaussianCandidateSelectorV1",
     "build_gaussian_candidate_selector_v1",
     "stable_quality_topk_indices",
+    "PreinsertRenderEvidenceError",
+    "PreinsertRenderEvidenceObserverV1",
+    "PreinsertRenderEvidenceV1",
+    "build_preinsert_render_evidence_v1",
 ]
