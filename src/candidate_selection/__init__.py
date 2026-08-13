@@ -19,6 +19,12 @@ from .gaussian_candidate_selector_v1 import (
     GaussianCandidateSelectorV1,
     build_gaussian_candidate_selector_v1,
 )
+from .gaussian_candidate_selector_v2 import (
+    CandidateMarginalUtilitySummaryV2,
+    CandidateMarginalUtilityTokenV2,
+    GaussianCandidateSelectorV2,
+    build_gaussian_candidate_selector_v2,
+)
 from .preinsert_render_evidence_v1 import (
     PreinsertRenderEvidenceError,
     PreinsertRenderEvidenceObserverV1,
@@ -39,6 +45,10 @@ __all__ = [
     "CandidateQualityEvidenceToken",
     "GaussianCandidateSelectorV1",
     "build_gaussian_candidate_selector_v1",
+    "CandidateMarginalUtilitySummaryV2",
+    "CandidateMarginalUtilityTokenV2",
+    "GaussianCandidateSelectorV2",
+    "build_gaussian_candidate_selector_v2",
     "stable_quality_topk_indices",
     "PreinsertRenderEvidenceError",
     "PreinsertRenderEvidenceObserverV1",

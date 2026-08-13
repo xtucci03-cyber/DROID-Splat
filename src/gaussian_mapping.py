@@ -29,6 +29,7 @@ from .camera_scheduling import build_historical_camera_scheduler
 from .candidate_selection import (
     build_gaussian_candidate_selector,
     build_gaussian_candidate_selector_v1,
+    build_gaussian_candidate_selector_v2,
     build_preinsert_render_evidence_v1,
 )
 from .gaussian_candidate_observer import build_gaussian_candidate_observer
@@ -147,6 +148,14 @@ class GaussianMapper(object):
         )
         self.preinsert_render_evidence_v1 = build_preinsert_render_evidence_v1(
             cfg.mapping.get("preinsert_render_evidence_v1", None),
+            device=self.device,
+        )
+        self.candidate_selector_v2 = build_gaussian_candidate_selector_v2(
+            cfg.mapping.get("candidate_selector_v2", None),
+            candidate_selector_v1=self.candidate_selector_v1,
+            resource_admission_mode=resource_admission_mode,
+            preinsert_render_evidence_v1=self.preinsert_render_evidence_v1,
+            confidence_snapshot_getter=self.get_camera_confidence_snapshot,
             device=self.device,
         )
 
@@ -1732,6 +1741,8 @@ class GaussianMapper(object):
         if len(cameras) == 0:
             return None
 
+        candidate_selector_v2 = getattr(self, "candidate_selector_v2", None)
+
         for cam in cameras:
             preinsert_render_evidence = self._capture_preinsert_render_evidence(
                 cam,
@@ -1742,12 +1753,14 @@ class GaussianMapper(object):
                 if (
                     self.candidate_observer is None
                     and self.candidate_selector_v1 is None
+                    and candidate_selector_v2 is None
                     and preinsert_render_evidence is None
                 ):
                     self.gaussians.extend_from_pcd_seq(cam, cam.uid, init=True)
                 elif (
                     self.candidate_selector is None
                     and self.candidate_selector_v1 is None
+                    and candidate_selector_v2 is None
                 ):
                     self.gaussians.extend_from_pcd_seq(
                         cam,
@@ -1770,6 +1783,10 @@ class GaussianMapper(object):
                         candidate_diagnostics["candidate_selector_v1"] = (
                             self.candidate_selector_v1
                         )
+                    if candidate_selector_v2 is not None:
+                        candidate_diagnostics["candidate_selector_v2"] = (
+                            candidate_selector_v2
+                        )
                     if preinsert_render_evidence is not None:
                         candidate_diagnostics["preinsert_render_evidence"] = (
                             preinsert_render_evidence
@@ -1786,12 +1803,14 @@ class GaussianMapper(object):
                 if (
                     self.candidate_observer is None
                     and self.candidate_selector_v1 is None
+                    and candidate_selector_v2 is None
                     and preinsert_render_evidence is None
                 ):
                     self.gaussians.extend_from_pcd_seq(cam, cam.uid, init=False)
                 elif (
                     self.candidate_selector is None
                     and self.candidate_selector_v1 is None
+                    and candidate_selector_v2 is None
                 ):
                     self.gaussians.extend_from_pcd_seq(
                         cam,
@@ -1813,6 +1832,10 @@ class GaussianMapper(object):
                     if self.candidate_selector_v1 is not None:
                         candidate_diagnostics["candidate_selector_v1"] = (
                             self.candidate_selector_v1
+                        )
+                    if candidate_selector_v2 is not None:
+                        candidate_diagnostics["candidate_selector_v2"] = (
+                            candidate_selector_v2
                         )
                     if preinsert_render_evidence is not None:
                         candidate_diagnostics["preinsert_render_evidence"] = (

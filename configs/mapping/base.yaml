@@ -90,6 +90,13 @@ candidate_selector_v1:
   logging:
     enabled: true
 
+# Default-off GCS-v2 V2-A marginal-utility component diagnostics. Observe is
+# pass-through and requires GCS-v1/M01 off plus preinsert render evidence on.
+candidate_selector_v2:
+  mode: "off"
+  logging:
+    enabled: true
+
 # Default-off, observe-only old-map render evidence for future GCS-v2.
 # Observe adds one no-grad render before each non-init candidate event.
 preinsert_render_evidence_v1:

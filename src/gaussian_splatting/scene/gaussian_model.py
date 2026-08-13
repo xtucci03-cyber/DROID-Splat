@@ -32,6 +32,7 @@ from ...candidate_selection import (
     GaussianCandidateActiveTopKV1,
     GaussianCandidateSelectorDryRun,
     GaussianCandidateSelectorV1,
+    GaussianCandidateSelectorV2,
     PreinsertRenderEvidenceV1,
 )
 from ..utils.general_utils import (
@@ -593,6 +594,7 @@ class GaussianModel:
         candidate_selector_v1: Optional[
             Union[GaussianCandidateSelectorV1, GaussianCandidateActiveTopKV1]
         ] = None,
+        candidate_selector_v2: Optional[GaussianCandidateSelectorV2] = None,
         mapper_update_id: Optional[int] = None,
         preinsert_render_evidence: Optional[PreinsertRenderEvidenceV1] = None,
     ):
@@ -618,7 +620,11 @@ class GaussianModel:
             raise ValueError(
                 "candidate_selector_v1 requires candidate_observer to be active."
             )
-        if candidate_observer is None and not selector_v1_active:
+        if (
+            candidate_observer is None
+            and not selector_v1_active
+            and candidate_selector_v2 is None
+        ):
             features = self.create_pcd_from_image(
                 cam_info, init, scale=scale, depthmap=depthmap, mask=mask, downsample_factor=downsample_factor
             )
@@ -704,6 +710,23 @@ class GaussianModel:
                         init=init,
                     )
 
+            marginal_utility_token = None
+            if candidate_selector_v2 is not None:
+                marginal_utility_token = candidate_selector_v2.observe_before_extend(
+                    xyz=fused_point_cloud,
+                    features=features,
+                    scales=scales,
+                    rotations=rots,
+                    opacities=opacities,
+                    camera=cam_info,
+                    depthmap=depthmap,
+                    depth_source=candidate_metadata.depth_source,
+                    mapper_update_id=mapper_update_id,
+                    init=init,
+                    gaussian_before=len(self),
+                    preinsert_render_evidence=preinsert_render_evidence,
+                )
+
             # OURS-M01: Candidate admission hook before persistent Gaussian insertion.
             if active_selection is not None and self.resource_admission is not None:
                 raise RuntimeError(
@@ -772,6 +795,13 @@ class GaussianModel:
                         dropped_candidate_count=dropped_candidate_count,
                         gaussian_after_extend=len(self),
                     )
+            if candidate_selector_v2 is not None:
+                candidate_selector_v2.record_after_extend(
+                    marginal_utility_token,
+                    admitted_candidate_count=admitted_candidate_count,
+                    dropped_candidate_count=dropped_candidate_count,
+                    gaussian_after_extend=len(self),
+                )
         else:
             print("No points in the point cloud")
             if candidate_observer is not None:
@@ -829,6 +859,20 @@ class GaussianModel:
                         dropped_candidate_count=0,
                         gaussian_after_extend=len(self),
                     )
+            if candidate_selector_v2 is not None:
+                marginal_utility_token = candidate_selector_v2.observe_empty(
+                    camera=cam_info,
+                    mapper_update_id=mapper_update_id,
+                    init=init,
+                    gaussian_before=len(self),
+                    preinsert_render_evidence=preinsert_render_evidence,
+                )
+                candidate_selector_v2.record_after_extend(
+                    marginal_utility_token,
+                    admitted_candidate_count=0,
+                    dropped_candidate_count=0,
+                    gaussian_after_extend=len(self),
+                )
 
     def prune_points(self, mask):
         valid_points_mask = ~mask
