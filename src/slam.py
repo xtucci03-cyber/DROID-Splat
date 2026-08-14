@@ -35,6 +35,16 @@ from .gaussian_splatting import eval_utils
 from .gaussian_splatting.utils.graphics_utils import getProjectionMatrix2, focal2fov
 from .gaussian_splatting.gui import gui_utils, slam_gui
 from .utils import clone_obj, get_all_queue
+from .runtime_process_diagnostics_v1 import (
+    ChildProcessFailure,
+    PROCESS_ROLE_SPECS,
+    ProcessRecord,
+    RuntimeProcessDiagnosticsV1,
+    cleanup_processes_bounded,
+    get_queue_item_or_child_failure,
+    run_process_target_with_diagnostics,
+    wait_for_condition_or_child_failure,
+)
 
 # A logger for this file
 log = logging.getLogger(__name__)
@@ -77,6 +87,13 @@ class SLAM:
 
         self.cfg = cfg
         self.device = cfg.get("device", torch.device("cuda:0"))
+        self.runtime_process_diagnostics_v1 = RuntimeProcessDiagnosticsV1.from_config(
+            cfg.get("runtime_process_diagnostics_v1", None)
+        )
+        self._diagnostic_stage_enabled = (
+            self.runtime_process_diagnostics_v1.enabled
+            and self.runtime_process_diagnostics_v1.stage_logging
+        )
         performance_monitor_cfg = cfg.mapping.get("performance_monitor", None)
         self.performance_monitor_enabled = (
             bool(performance_monitor_cfg.get("enabled", False))
@@ -196,6 +213,23 @@ class SLAM:
             logger.info(colored("[Main]: " + msg, "green"))
         else:
             print(colored("[Main]: " + msg, "green"))
+
+    def _diagnostic_stage(
+        self,
+        *,
+        rank: int,
+        role: str,
+        stage: str,
+        phase: str,
+        **fields,
+    ) -> None:
+        self.runtime_process_diagnostics_v1.emit_stage(
+            rank=rank,
+            role=role,
+            stage=stage,
+            phase=phase,
+            **fields,
+        )
 
     def _performance_emit(
         self,
@@ -371,6 +405,14 @@ class SLAM:
         for frame in tqdm(stream):
 
             old_count = self.frontend.count  # Memoize current state
+            if self._diagnostic_stage_enabled:
+                self._diagnostic_stage(
+                    rank=rank,
+                    role="frontend_tracking",
+                    stage="frontend_update",
+                    phase="begin",
+                    frame_id=int(old_count),
+                )
 
             if self.cfg.with_dyn and stream.has_dyn_masks:
                 timestamp, image, depth, intrinsic, gt_pose, static_mask = frame
@@ -390,6 +432,14 @@ class SLAM:
                 with communication_lock:
                     cond_mapping.wait_for(lambda: self.mapping_done > 0)
 
+            if self._diagnostic_stage_enabled:
+                self._diagnostic_stage(
+                    rank=rank,
+                    role="frontend_tracking",
+                    stage="frontend_operator",
+                    phase="begin",
+                    frame_id=int(old_count),
+                )
             if self.performance_monitor_enabled:
                 frontend_start_ns = perf_counter_ns()
                 self.frontend(timestamp, image, depth, intrinsic, gt_pose, static_mask=static_mask, lock=ba_lock)
@@ -397,16 +447,49 @@ class SLAM:
                 frontend_call_count += 1
             else:
                 self.frontend(timestamp, image, depth, intrinsic, gt_pose, static_mask=static_mask, lock=ba_lock)
+            if self._diagnostic_stage_enabled:
+                self._diagnostic_stage(
+                    rank=rank,
+                    role="frontend_tracking",
+                    stage="frontend_operator",
+                    phase="end",
+                    frame_id=int(old_count),
+                    frontend_count=int(self.frontend.count),
+                )
 
             maybe_notify_other_threads_to_start()
             # Check if we actually inserted a new frame and optimized
             if self.frontend.count > old_count:
                 synchronize_with_other_threads(sema_backend, sema_mapping)
+            if self._diagnostic_stage_enabled:
+                self._diagnostic_stage(
+                    rank=rank,
+                    role="frontend_tracking",
+                    stage="frontend_update",
+                    phase="end",
+                    frame_id=int(old_count),
+                    frontend_count=int(self.frontend.count),
+                )
 
         self.info(f"Ran Frontend {self.frontend.count} times!")
+        if self._diagnostic_stage_enabled:
+            self._diagnostic_stage(
+                rank=rank,
+                role="frontend_tracking",
+                stage="frontend_terminate",
+                phase="begin",
+                frontend_count=int(self.frontend.count),
+            )
         del self.frontend
         torch.cuda.empty_cache()
         gc.collect()
+        if self._diagnostic_stage_enabled:
+            self._diagnostic_stage(
+                rank=rank,
+                role="frontend_tracking",
+                stage="frontend_terminate",
+                phase="end",
+            )
 
         self.tracking_finished += 1
         self.all_finished += 1
@@ -588,6 +671,15 @@ class SLAM:
             if self.backend is None:
                 continue
 
+            if self._diagnostic_stage_enabled:
+                self._diagnostic_stage(
+                    rank=rank,
+                    role="backend",
+                    stage="backend_update",
+                    phase="begin",
+                    update_id=int(self.backend.count),
+                )
+
             ## If we run an additional loop detector -> Pull in visually similar candidate edges as well
             loop_ii, loop_jj = None, None
             if self.cfg.run_loop_detection and loop_queue is not None:
@@ -599,6 +691,14 @@ class SLAM:
                         all_loop_ii, all_loop_jj = merge_candidates(all_lc_candidates)
 
             ### Actual Backend call
+            if self._diagnostic_stage_enabled:
+                self._diagnostic_stage(
+                    rank=rank,
+                    role="backend",
+                    stage="backend_ba",
+                    phase="begin",
+                    update_id=int(self.backend.count),
+                )
             if self.performance_monitor_enabled:
                 backend_start_ns = perf_counter_ns()
                 self.backend_op(add_ii=all_loop_ii, add_jj=all_loop_jj, lock=ba_lock)
@@ -606,6 +706,21 @@ class SLAM:
                 backend_online_call_count += 1
             else:
                 self.backend_op(add_ii=all_loop_ii, add_jj=all_loop_jj, lock=ba_lock)
+            if self._diagnostic_stage_enabled:
+                self._diagnostic_stage(
+                    rank=rank,
+                    role="backend",
+                    stage="backend_ba",
+                    phase="end",
+                    update_id=int(self.backend.count),
+                )
+                self._diagnostic_stage(
+                    rank=rank,
+                    role="backend",
+                    stage="backend_update",
+                    phase="end",
+                    update_id=int(self.backend.count),
+                )
 
         sleep(self.sleep_time)  # Let other threads finish their last optimization
         # Try to instantiate again if needed
@@ -628,6 +743,14 @@ class SLAM:
 
                 msg = "Optimize full map: [{}, {}]!".format(0, t_end)
                 self.backend.info(msg)
+                if self._diagnostic_stage_enabled:
+                    self._diagnostic_stage(
+                        rank=rank,
+                        role="backend",
+                        stage="backend_ba",
+                        phase="begin",
+                        update_id="final",
+                    )
                 if self.performance_monitor_enabled:
                     final_backend_start_ns = perf_counter_ns()
                     self.final_backend_op(
@@ -647,11 +770,36 @@ class SLAM:
                         add_jj=all_loop_jj,
                         lock=ba_lock,
                     )
+                if self._diagnostic_stage_enabled:
+                    self._diagnostic_stage(
+                        rank=rank,
+                        role="backend",
+                        stage="backend_ba",
+                        phase="end",
+                        update_id="final",
+                    )
 
+        backend_count = int(self.backend.count) if self.backend is not None else 0
+        if self._diagnostic_stage_enabled:
+            self._diagnostic_stage(
+                rank=rank,
+                role="backend",
+                stage="backend_terminate",
+                phase="begin",
+                update_id=backend_count,
+            )
         if self.backend is not None:
             del self.backend
             torch.cuda.empty_cache()
             gc.collect()
+        if self._diagnostic_stage_enabled:
+            self._diagnostic_stage(
+                rank=rank,
+                role="backend",
+                stage="backend_terminate",
+                phase="end",
+                update_id=backend_count,
+            )
 
         self.backend_finished += 1
         self.all_finished += 1
@@ -763,11 +911,28 @@ class SLAM:
         while not finished and run:
             finished = self.gaussian_mapper(mapping_queue, received_mapping, True)
 
+        gaussian_count = len(self.gaussian_mapper.gaussians) if self.gaussian_mapper is not None else 0
+        if self._diagnostic_stage_enabled:
+            self._diagnostic_stage(
+                rank=rank,
+                role="gaussian_mapping",
+                stage="mapper_terminate",
+                phase="begin",
+                gaussian_count=int(gaussian_count),
+            )
         self.gaussian_mapping_finished += 1
         # Let the user still interact with the GUI
         while self.mapping_visualizing_finished < 1:
             pass
 
+        if self._diagnostic_stage_enabled:
+            self._diagnostic_stage(
+                rank=rank,
+                role="gaussian_mapping",
+                stage="mapper_terminate",
+                phase="end",
+                gaussian_count=int(gaussian_count),
+            )
         self.all_finished += 1
         self.info("Gaussian Mapping Done!")
 
@@ -1180,6 +1345,7 @@ class SLAM:
         processes: List[mp.Process],
         stream=None,
         gaussian_mapper_last_state: Optional[eval_utils.EvaluatePacket] = None,
+        process_records: Optional[List[ProcessRecord]] = None,
     ) -> None:
         """Evaluate the system and then shut down all Process."""
 
@@ -1210,20 +1376,38 @@ class SLAM:
                 self.evaluate(stream, gaussian_mapper_last_state=gaussian_mapper_last_state)
             self.info("Evaluation complete", logger=log)
 
-        for i, p in enumerate(processes):
-            p.terminate()
-            p.join()
-            self.info("Terminated process {}".format(p.name))
+        if self.runtime_process_diagnostics_v1.enabled:
+            remaining = cleanup_processes_bounded(
+                process_records or [],
+                self.runtime_process_diagnostics_v1,
+            )
+            if remaining:
+                raise RuntimeError(
+                    "Runtime diagnostics cleanup timed out for roles: "
+                    + ", ".join(record.role for record in remaining)
+                )
+            for process in processes:
+                self.info("Terminated process {}".format(process.name))
+        else:
+            for i, p in enumerate(processes):
+                p.terminate()
+                p.join()
+                self.info("Terminated process {}".format(p.name))
         self.info("Terminate: Done!", logger=log)
 
     def run(self, stream) -> None:
         """Main SLAM function to manage the multi-threaded application."""
-        processes = [
+        process_definitions = [
             # NOTE The OpenCV thread always needs to be 0 to work somehow
-            mp.Process(target=self.show_stream, args=(0, self.input_pipe, self.cfg.show_stream), name="OpenCV Stream"),
-            mp.Process(
-                target=self.tracking,
-                args=(
+            (
+                PROCESS_ROLE_SPECS[0],
+                self.show_stream,
+                (0, self.input_pipe, self.cfg.show_stream),
+            ),
+            (
+                PROCESS_ROLE_SPECS[1],
+                self.tracking,
+                (
                     1,
                     self.communication_lock,
                     stream,
@@ -1233,22 +1417,22 @@ class SLAM:
                     self.input_pipe,
                     self.ba_lock,
                 ),
-                name="Frontend Tracking",
             ),
-            mp.Process(
-                target=self.global_ba,
-                args=(2, self.ba_lock, self.sema_backend, self.loop_queue, self.cfg.run_backend),
-                name="Backend",
+            (
+                PROCESS_ROLE_SPECS[2],
+                self.global_ba,
+                (2, self.ba_lock, self.sema_backend, self.loop_queue, self.cfg.run_backend),
             ),
-            mp.Process(
-                target=self.loop_detection,
-                args=(3, self.loop_queue, self.cfg.run_loop_detection),
-                name="Loop Detector",
+            (
+                PROCESS_ROLE_SPECS[3],
+                self.loop_detection,
+                (3, self.loop_queue, self.cfg.run_loop_detection),
             ),
-            mp.Process(target=self.visualizing, args=(4, self.cfg.run_visualization), name="Visualizing"),
-            mp.Process(
-                target=self.gaussian_mapping,
-                args=(
+            (PROCESS_ROLE_SPECS[4], self.visualizing, (4, self.cfg.run_visualization)),
+            (
+                PROCESS_ROLE_SPECS[5],
+                self.gaussian_mapping,
+                (
                     5,
                     self.communication_lock,
                     self.cond_mapping,
@@ -1257,18 +1441,53 @@ class SLAM:
                     self.received_mapping,
                     self.cfg.run_mapping,
                 ),
-                name="Gaussian Mapping",
             ),
-            mp.Process(
-                target=self.mapping_gui,
-                args=(6, self.cfg.run_mapping_gui and self.cfg.run_mapping),
-                name="Mapping GUI",
+            (
+                PROCESS_ROLE_SPECS[6],
+                self.mapping_gui,
+                (6, self.cfg.run_mapping_gui and self.cfg.run_mapping),
             ),
         ]
 
+        diagnostics = self.runtime_process_diagnostics_v1
+        diagnostic_interrupt_event = mp.Event() if diagnostics.enabled else None
+        processes = []
+        for spec, target, target_args in process_definitions:
+            if diagnostics.enabled:
+                process = mp.Process(
+                    target=run_process_target_with_diagnostics,
+                    args=(
+                        diagnostics,
+                        spec,
+                        target,
+                        target_args,
+                        diagnostic_interrupt_event,
+                    ),
+                    name=spec.process_name,
+                )
+            else:
+                process = mp.Process(
+                    target=target,
+                    args=target_args,
+                    name=spec.process_name,
+                )
+            processes.append(process)
+
         self.num_running_thread[0] += len(processes)
-        for p in processes:
-            p.start()
+        process_records = []
+        for process, (spec, _, _) in zip(processes, process_definitions):
+            process.start()
+            if diagnostics.enabled:
+                record = ProcessRecord.from_started_process(process, spec)
+                process_records.append(record)
+                diagnostics.emit(
+                    "process_started",
+                    pid=record.pid,
+                    ppid=os.getpid(),
+                    rank=record.rank,
+                    role=record.role,
+                    process_name=record.process_name,
+                )
 
         start_time = perf_counter()
         self.info(str(start_time), logger=log)
@@ -1287,34 +1506,62 @@ class SLAM:
                 phase="begin",
             )
 
-        # Wait for all processes to have finished before terminating and for final mapping update to be transmitted
-        if self.cfg.run_mapping:
-            while self.mapping_queue.empty():
-                pass
-            # Receive the final update, so we can do something with it ...
-            a = self.mapping_queue.get()
-            self.info("Received final mapping update!", logger=log)
-            if a == "None":
-                a = deepcopy(a)
-                gaussian_mapper_last_state = None
+        try:
+            # Wait for all processes to have finished before terminating and for final mapping update to be transmitted
+            if self.cfg.run_mapping:
+                if diagnostics.enabled and diagnostics.fail_fast_on_child_error:
+                    a = get_queue_item_or_child_failure(
+                        self.mapping_queue,
+                        process_records,
+                        diagnostics,
+                        interrupt_event=diagnostic_interrupt_event,
+                    )
+                else:
+                    while self.mapping_queue.empty():
+                        pass
+                    # Receive the final update, so we can do something with it ...
+                    a = self.mapping_queue.get()
+                self.info("Received final mapping update!", logger=log)
+                if a == "None":
+                    a = deepcopy(a)
+                    gaussian_mapper_last_state = None
+                else:
+                    a.cameras_to("cpu")  # Put all dense tensors on the CPU before cloning to avoid OOM
+                    gaussian_mapper_last_state = clone_obj(a)
+
+                del a  # NOTE Always delete receive object from a multiprocessing Queue!
+                torch.cuda.empty_cache()
+                gc.collect()
+                self.received_mapping.set()
+
+            # Let the processes run until they are finished (When using GUI's these need to be closed manually)
             else:
-                a.cameras_to("cpu")  # Put all dense tensors on the CPU before cloning to avoid OOM
-                gaussian_mapper_last_state = clone_obj(a)
+                gaussian_mapper_last_state = None
 
-            del a  # NOTE Always delete receive object from a multiprocessing Queue!
-            torch.cuda.empty_cache()
-            gc.collect()
-            self.received_mapping.set()
+            if gaussian_mapper_last_state is not None:
+                gaussian_mapper_last_state.cameras_to(self.device)
 
-        # Let the processes run until they are finished (When using GUI's these need to be closed manually)
-        else:
-            gaussian_mapper_last_state = None
-
-        if gaussian_mapper_last_state is not None:
-            gaussian_mapper_last_state.cameras_to(self.device)
-
-        while self.all_finished < self.num_running_thread:
-            pass
+            if diagnostics.enabled and diagnostics.fail_fast_on_child_error:
+                wait_for_condition_or_child_failure(
+                    lambda: bool(self.all_finished >= self.num_running_thread),
+                    process_records,
+                    diagnostics,
+                    interrupt_event=diagnostic_interrupt_event,
+                )
+            else:
+                while self.all_finished < self.num_running_thread:
+                    pass
+        except KeyboardInterrupt:
+            if not diagnostics.enabled:
+                raise
+            if diagnostic_interrupt_event is not None:
+                diagnostic_interrupt_event.set()
+            diagnostics.emit("parent_process_interrupted", interrupt_kind="keyboard_interrupt")
+            cleanup_processes_bounded(process_records, diagnostics)
+            raise
+        except ChildProcessFailure:
+            cleanup_processes_bounded(process_records, diagnostics)
+            raise
 
         self.info("##########", logger=log)
         end_time = perf_counter()
@@ -1334,7 +1581,12 @@ class SLAM:
                 frame_count=len(stream),
             )
 
-        self.terminate(processes, stream, gaussian_mapper_last_state)
+        self.terminate(
+            processes,
+            stream,
+            gaussian_mapper_last_state,
+            process_records=process_records,
+        )
         if self.performance_monitor_enabled:
             self._performance_emit(
                 process_role="main",

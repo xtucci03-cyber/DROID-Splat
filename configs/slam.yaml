@@ -23,6 +23,14 @@ with_dyn: False # Filter out dynamic objects if masks are provided in the datase
 opt_intr: False # Optimizes additional intrinsic parameters
 sleep_delay: 0.45 # Sleep timer to cool off the system sometimes
 
+# Default-off process diagnostics for native-crash investigations. These
+# events do not synchronize CUDA or sample tensor contents.
+runtime_process_diagnostics_v1:
+  enabled: false
+  stage_logging: true
+  fail_fast_on_child_error: true
+  cleanup_timeout_s: 5.0
+
 ## Components
 run_frontend: True # This should always be True!
 run_backend: True # Global optimization

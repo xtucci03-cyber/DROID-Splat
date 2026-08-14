@@ -60,6 +60,18 @@ class GaussianMapper(object):
     def __init__(self, cfg, slam, gui_qs=None):
         self.cfg = cfg
         self.slam = slam
+        self.runtime_process_diagnostics_v1 = getattr(
+            slam,
+            "runtime_process_diagnostics_v1",
+            None,
+        )
+        self._candidate_diagnostic_stage = (
+            self._runtime_diagnostic_stage
+            if self.runtime_process_diagnostics_v1 is not None
+            and self.runtime_process_diagnostics_v1.enabled
+            and self.runtime_process_diagnostics_v1.stage_logging
+            else None
+        )
         self.video = slam.video
         self.device = cfg.device
         self.mode = cfg.mode
@@ -243,6 +255,18 @@ class GaussianMapper(object):
 
     def info(self, msg: str):
         print(colored("[Gaussian Mapper] " + msg, "magenta"))
+
+    def _runtime_diagnostic_stage(self, *, stage: str, phase: str, **fields) -> None:
+        diagnostics = getattr(self, "runtime_process_diagnostics_v1", None)
+        if diagnostics is None:
+            return
+        diagnostics.emit_stage(
+            rank=5,
+            role="gaussian_mapping",
+            stage=stage,
+            phase=phase,
+            **fields,
+        )
 
     def _mapping_activity_call(self, operation: str, *args, **kwargs):
         observer = self.mapping_activity_observer
@@ -1340,6 +1364,14 @@ class GaussianMapper(object):
                         mapping_iter=iter,
                     )
 
+                if self._candidate_diagnostic_stage is not None:
+                    self._candidate_diagnostic_stage(
+                        stage="densify_prune",
+                        phase="begin",
+                        update_id=int(self.count),
+                        iteration=int(iter),
+                        gaussian_count=int(len(self.gaussians)),
+                    )
                 if self.lifecycle_observer_enabled:
                     lifecycle_event = self.gaussians.densify_and_prune(
                         **self.update_params.densify.vanilla,
@@ -1386,6 +1418,14 @@ class GaussianMapper(object):
                 else:
                     self.gaussians.densify_and_prune(
                         **self.update_params.densify.vanilla
+                    )
+                if self._candidate_diagnostic_stage is not None:
+                    self._candidate_diagnostic_stage(
+                        stage="densify_prune",
+                        phase="end",
+                        update_id=int(self.count),
+                        iteration=int(iter),
+                        gaussian_count=int(len(self.gaussians)),
                     )
 
                 if self.performance_monitor_enabled:
@@ -1508,12 +1548,26 @@ class GaussianMapper(object):
 
         occ_aware_visibility = {}
         self.gaussians.n_obs.fill_(0)  # Reset observation count
+        if self._candidate_diagnostic_stage is not None:
+            self._candidate_diagnostic_stage(
+                stage="covisibility_render",
+                phase="begin",
+                update_id=int(self.count),
+                gaussian_count=int(len(self.gaussians)),
+            )
         for view in frames:
             render_pkg = render(view, self.gaussians, self.pipeline_params, self.background)
             visibility = (render_pkg["n_touched"] > 0).long()
             occ_aware_visibility[view.uid] = visibility
             # Count when at least one pixel was touched by the Gaussian
             self.gaussians.n_obs += visibility  # Increase observation count
+        if self._candidate_diagnostic_stage is not None:
+            self._candidate_diagnostic_stage(
+                stage="covisibility_render",
+                phase="end",
+                update_id=int(self.count),
+                gaussian_count=int(len(self.gaussians)),
+            )
 
         to_prune = self.gaussians.n_obs < visibility_th
         if mode == "new":
@@ -1524,8 +1578,22 @@ class GaussianMapper(object):
             prune_last = self.gaussians.unique_kfIDs >= sorted_frames[last_idx - 1]
             to_prune = torch.logical_and(to_prune, prune_last)
 
+        if self._candidate_diagnostic_stage is not None:
+            self._candidate_diagnostic_stage(
+                stage="covisibility_prune",
+                phase="begin",
+                update_id=int(self.count),
+                gaussian_count=int(len(self.gaussians)),
+            )
         if to_prune.sum() > 0:
             self.gaussians.prune_points(to_prune.to(self.device))
+        if self._candidate_diagnostic_stage is not None:
+            self._candidate_diagnostic_stage(
+                stage="covisibility_prune",
+                phase="end",
+                update_id=int(self.count),
+                gaussian_count=int(len(self.gaussians)),
+            )
 
         end = time.time()
         self.info(f"({mode}) Covisibility pruning took {(end - start):.2f}s, pruned: {to_prune.sum()} Gaussians")
@@ -1726,14 +1794,65 @@ class GaussianMapper(object):
                 mapper_update_id=self.count,
                 reason="init_bypass",
             )
-        return observer.capture(
-            camera=cam,
-            gaussians=self.gaussians,
-            renderer=render,
-            pipeline_params=self.pipeline_params,
-            background=self.background,
-            mapper_update_id=self.count,
-        )
+        diagnostic_stage = getattr(self, "_candidate_diagnostic_stage", None)
+        if diagnostic_stage is not None:
+            diagnostic_stage(
+                stage="preinsert_render",
+                phase="begin",
+                frame_id=int(cam.uid),
+                update_id=int(self.count),
+                gaussian_count=int(gaussian_count),
+            )
+        else:
+            return observer.capture(
+                camera=cam,
+                gaussians=self.gaussians,
+                renderer=render,
+                pipeline_params=self.pipeline_params,
+                background=self.background,
+                mapper_update_id=self.count,
+            )
+        try:
+            evidence = observer.capture(
+                camera=cam,
+                gaussians=self.gaussians,
+                renderer=render,
+                pipeline_params=self.pipeline_params,
+                background=self.background,
+                mapper_update_id=self.count,
+            )
+        except KeyboardInterrupt:
+            if diagnostic_stage is not None:
+                diagnostic_stage(
+                    stage="preinsert_render",
+                    phase="end",
+                    status="interrupted",
+                    frame_id=int(cam.uid),
+                    update_id=int(self.count),
+                    gaussian_count=int(gaussian_count),
+                )
+            raise
+        except BaseException:
+            if diagnostic_stage is not None:
+                diagnostic_stage(
+                    stage="preinsert_render",
+                    phase="end",
+                    status="error",
+                    frame_id=int(cam.uid),
+                    update_id=int(self.count),
+                    gaussian_count=int(gaussian_count),
+                )
+            raise
+        if diagnostic_stage is not None:
+            diagnostic_stage(
+                stage="preinsert_render",
+                phase="end",
+                status="ok",
+                frame_id=int(cam.uid),
+                update_id=int(self.count),
+                gaussian_count=int(gaussian_count),
+            )
+        return evidence
 
     def add_new_gaussians(self, cameras: List[Camera]) -> Camera | None:
         """Initialize new Gaussians based on the provided views (images, poses (, depth))"""
@@ -1742,6 +1861,11 @@ class GaussianMapper(object):
             return None
 
         candidate_selector_v2 = getattr(self, "candidate_selector_v2", None)
+        candidate_diagnostic_stage = getattr(
+            self,
+            "_candidate_diagnostic_stage",
+            None,
+        )
 
         for cam in cameras:
             preinsert_render_evidence = self._capture_preinsert_render_evidence(
@@ -1756,7 +1880,12 @@ class GaussianMapper(object):
                     and candidate_selector_v2 is None
                     and preinsert_render_evidence is None
                 ):
-                    self.gaussians.extend_from_pcd_seq(cam, cam.uid, init=True)
+                    self.gaussians.extend_from_pcd_seq(
+                        cam,
+                        cam.uid,
+                        init=True,
+                        diagnostic_stage=candidate_diagnostic_stage,
+                    )
                 elif (
                     self.candidate_selector is None
                     and self.candidate_selector_v1 is None
@@ -1769,6 +1898,7 @@ class GaussianMapper(object):
                         candidate_observer=self.candidate_observer,
                         mapper_update_id=self.count,
                         preinsert_render_evidence=preinsert_render_evidence,
+                        diagnostic_stage=candidate_diagnostic_stage,
                     )
                 else:
                     candidate_diagnostics = {
@@ -1791,6 +1921,9 @@ class GaussianMapper(object):
                         candidate_diagnostics["preinsert_render_evidence"] = (
                             preinsert_render_evidence
                         )
+                    candidate_diagnostics["diagnostic_stage"] = (
+                        candidate_diagnostic_stage
+                    )
                     self.gaussians.extend_from_pcd_seq(
                         cam,
                         cam.uid,
@@ -1806,7 +1939,12 @@ class GaussianMapper(object):
                     and candidate_selector_v2 is None
                     and preinsert_render_evidence is None
                 ):
-                    self.gaussians.extend_from_pcd_seq(cam, cam.uid, init=False)
+                    self.gaussians.extend_from_pcd_seq(
+                        cam,
+                        cam.uid,
+                        init=False,
+                        diagnostic_stage=candidate_diagnostic_stage,
+                    )
                 elif (
                     self.candidate_selector is None
                     and self.candidate_selector_v1 is None
@@ -1819,6 +1957,7 @@ class GaussianMapper(object):
                         candidate_observer=self.candidate_observer,
                         mapper_update_id=self.count,
                         preinsert_render_evidence=preinsert_render_evidence,
+                        diagnostic_stage=candidate_diagnostic_stage,
                     )
                 else:
                     candidate_diagnostics = {
@@ -1841,6 +1980,9 @@ class GaussianMapper(object):
                         candidate_diagnostics["preinsert_render_evidence"] = (
                             preinsert_render_evidence
                         )
+                    candidate_diagnostics["diagnostic_stage"] = (
+                        candidate_diagnostic_stage
+                    )
                     self.gaussians.extend_from_pcd_seq(
                         cam,
                         cam.uid,
@@ -1968,6 +2110,14 @@ class GaussianMapper(object):
                 new_camera_count=len(self.new_cameras),
             )
 
+        if self._candidate_diagnostic_stage is not None:
+            self._candidate_diagnostic_stage(
+                stage="mapping_optimization",
+                phase="begin",
+                update_id=int(self.count),
+                iteration=0,
+                gaussian_count=int(len(self.gaussians)),
+            )
         for iter in tqdm(range(iters), desc=colored("Gaussian Optimization", "magenta"), colour="magenta"):
             do_densify = (
                 iter % self.update_params.prune_densify_every == 0 and iter < self.update_params.prune_densify_until
@@ -1987,6 +2137,14 @@ class GaussianMapper(object):
                 iter, frames, prune_densify=do_densify, optimize_poses=self.update_params.optimize_poses
             )
             self.loss_list.append(loss)
+        if self._candidate_diagnostic_stage is not None:
+            self._candidate_diagnostic_stage(
+                stage="mapping_optimization",
+                phase="end",
+                update_id=int(self.count),
+                iteration=int(iters),
+                gaussian_count=int(len(self.gaussians)),
+            )
 
         if self.performance_monitor_enabled:
             self._performance_stage_end(

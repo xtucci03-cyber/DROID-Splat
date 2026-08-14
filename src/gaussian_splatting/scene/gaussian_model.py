@@ -597,7 +597,19 @@ class GaussianModel:
         candidate_selector_v2: Optional[GaussianCandidateSelectorV2] = None,
         mapper_update_id: Optional[int] = None,
         preinsert_render_evidence: Optional[PreinsertRenderEvidenceV1] = None,
+        diagnostic_stage=None,
     ):
+        emit_diagnostic_stage = None
+        if diagnostic_stage is not None:
+            def emit_diagnostic_stage(stage, phase):
+                diagnostic_stage(
+                    stage=stage,
+                    phase=phase,
+                    frame_id=int(cam_info.uid),
+                    update_id=None if mapper_update_id is None else int(mapper_update_id),
+                    gaussian_count=len(self),
+                )
+
         if preinsert_render_evidence is not None:
             preinsert_render_evidence.validate_for_event(
                 camera=cam_info,
@@ -634,6 +646,8 @@ class GaussianModel:
             raise ValueError(
                 "candidate_selector_v1 requires candidate_observer to be active."
             )
+        if emit_diagnostic_stage is not None:
+            emit_diagnostic_stage("candidate_generation", "begin")
         if (
             candidate_observer is None
             and not selector_v1_active
@@ -655,6 +669,8 @@ class GaussianModel:
             )
             features = generation_result.candidates
             candidate_metadata = generation_result.metadata
+        if emit_diagnostic_stage is not None:
+            emit_diagnostic_stage("candidate_generation", "end")
 
         if features is not None:
             fused_point_cloud, features, scales, rots, opacities = features
@@ -727,6 +743,8 @@ class GaussianModel:
             marginal_utility_token = None
             marginal_utility_active_selection = None
             if candidate_selector_v2 is not None:
+                if emit_diagnostic_stage is not None:
+                    emit_diagnostic_stage("v2_selection", "begin")
                 if selector_v2_active:
                     marginal_utility_active_selection = (
                         candidate_selector_v2.select_before_extend(
@@ -766,6 +784,8 @@ class GaussianModel:
                             preinsert_render_evidence=preinsert_render_evidence,
                         )
                     )
+                if emit_diagnostic_stage is not None:
+                    emit_diagnostic_stage("v2_selection", "end")
 
             # OURS-M01: Candidate admission hook before persistent Gaussian insertion.
             if active_selection is not None and self.resource_admission is not None:
@@ -774,7 +794,11 @@ class GaussianModel:
                     "disabled; refusing a possible second selection."
                 )
             if self.resource_admission is None:
+                if emit_diagnostic_stage is not None:
+                    emit_diagnostic_stage("extend", "begin")
                 self.extend_from_pcd(fused_point_cloud, features, scales, rots, opacities, kf_id)
+                if emit_diagnostic_stage is not None:
+                    emit_diagnostic_stage("extend", "end")
                 admitted_candidate_count = int(fused_point_cloud.shape[0])
                 dropped_candidate_count = 0
             else:
@@ -790,6 +814,8 @@ class GaussianModel:
                     gaussian_before=len(self),
                 )
 
+                if emit_diagnostic_stage is not None:
+                    emit_diagnostic_stage("extend", "begin")
                 self.extend_from_pcd(
                     result.xyz,
                     result.features,
@@ -798,6 +824,8 @@ class GaussianModel:
                     result.opacities,
                     kf_id,
                 )
+                if emit_diagnostic_stage is not None:
+                    emit_diagnostic_stage("extend", "end")
                 admitted_candidate_count = result.admitted_count
                 dropped_candidate_count = result.dropped_count
 
