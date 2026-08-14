@@ -1,9 +1,9 @@
-"""Observe-only marginal-utility component diagnostics for GCS-v2 V2-A.
+"""Marginal-utility diagnostics and fixed-budget experiments for GCS-v2.
 
 This module consumes the already-captured pre-insertion render evidence.  It
-never renders, ranks, filters, or returns candidate indices.  Projection,
-source-depth lineage, current-confidence provenance, low-resolution cell
-mapping, and confidence sampling are delegated to the frozen GCS-v1 reader.
+never renders.  The original V2-A observer remains pass-through; the separate
+active class ranks the same candidate batch under a fixed budget without
+changing the frozen GCS-v1 implementation.
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import math
+from numbers import Integral, Real
 import time
 from typing import Any, Callable, Mapping, Optional
 
@@ -18,22 +19,35 @@ import torch
 
 from .gaussian_candidate_active_topk_v1 import (
     ActiveConfidenceEvidenceError,
+    CONFIDENCE_SAMPLING_METHOD,
     GaussianCandidateActiveTopKV1,
+    _known_snapshot_failure,
 )
 from .preinsert_render_evidence_v1 import (
     PreinsertRenderEvidenceError,
     PreinsertRenderEvidenceV1,
+)
+from ..resource_management.m01_resource_admission.resource_admission import (
+    deterministic_uniform_indices,
 )
 
 
 LOG_PREFIX = "[GaussianCandidateSelectorV2]"
 SCHEMA_VERSION = 1
 MODE = "observe"
-SUPPORTED_MODES = frozenset({"off", MODE})
+ACTIVE_FIXED_K_MODE = "active_fixed_k"
+SUPPORTED_MODES = frozenset({"off", MODE, ACTIVE_FIXED_K_MODE})
+ACTIVE_STRATEGIES = frozenset(
+    {"coverage", "evidence", "evidence_projected_cell"}
+)
+DEFAULT_FIXED_K = 600
+DEFAULT_DIVERSITY_STRENGTH = 0.1
 NUMERICAL_EPSILON = 1.0e-6
 CONFIDENCE_NORMALIZER = math.sqrt(2.0)
 
-_TOP_LEVEL_FIELDS = frozenset({"mode", "logging"})
+_TOP_LEVEL_FIELDS = frozenset(
+    {"mode", "strategy", "fixed_k", "diversity_strength", "logging"}
+)
 _LOGGING_FIELDS = frozenset({"enabled"})
 _COMPONENTS = (
     "confidence",
@@ -84,6 +98,46 @@ def _normalize_mode(value: Any) -> str:
     return mode
 
 
+def _normalize_strategy(value: Any) -> str:
+    if not isinstance(value, str):
+        raise TypeError("mapping.candidate_selector_v2.strategy must be a string.")
+    strategy = value.strip().lower()
+    if strategy not in ACTIVE_STRATEGIES:
+        raise ValueError(
+            "mapping.candidate_selector_v2.strategy must be one of "
+            f"{sorted(ACTIVE_STRATEGIES)}, got {strategy!r}."
+        )
+    return strategy
+
+
+def _normalize_fixed_k(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        raise TypeError(
+            "mapping.candidate_selector_v2.fixed_k must be a positive integer."
+        )
+    value = int(value)
+    if value < 1:
+        raise ValueError(
+            "mapping.candidate_selector_v2.fixed_k must be greater than zero."
+        )
+    return value
+
+
+def _normalize_diversity_strength(value: Any) -> float:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise TypeError(
+            "mapping.candidate_selector_v2.diversity_strength must be a "
+            "finite non-negative number."
+        )
+    value = float(value)
+    if not math.isfinite(value) or value < 0.0:
+        raise ValueError(
+            "mapping.candidate_selector_v2.diversity_strength must be a "
+            "finite non-negative number."
+        )
+    return value
+
+
 def build_gaussian_candidate_selector_v2(
     config: Optional[Mapping[str, Any]],
     *,
@@ -93,7 +147,7 @@ def build_gaussian_candidate_selector_v2(
     confidence_snapshot_getter: Callable[..., Any],
     device: Any,
 ) -> Optional["GaussianCandidateSelectorV2"]:
-    """Build V2-A; exact off returns ``None`` without runtime state."""
+    """Build V2 diagnostics/selection; exact off has no runtime state."""
 
     if config is None:
         return None
@@ -118,30 +172,40 @@ def build_gaussian_candidate_selector_v2(
     if not logging_enabled:
         raise ValueError(
             "mapping.candidate_selector_v2.logging.enabled must be true "
-            "in observe mode."
+            "outside off mode."
         )
     if str(resource_admission_mode).strip().lower() != "disabled":
         raise ValueError(
-            "GCS-v2 observe mode requires mapping.resource_admission.mode=disabled."
+            "GCS-v2 requires mapping.resource_admission.mode=disabled."
         )
     if candidate_selector_v1 is not None:
         raise ValueError(
-            "GCS-v2 observe mode requires mapping.candidate_selector_v1.mode=off."
+            "GCS-v2 requires mapping.candidate_selector_v1.mode=off."
         )
     if (
         preinsert_render_evidence_v1 is None
         or getattr(preinsert_render_evidence_v1, "mode", None) != "observe"
     ):
         raise ValueError(
-            "GCS-v2 observe mode requires "
+            "GCS-v2 requires "
             "mapping.preinsert_render_evidence_v1.mode=observe."
         )
     if not callable(confidence_snapshot_getter):
         raise TypeError("confidence_snapshot_getter must be callable.")
-    return GaussianCandidateSelectorV2(
-        confidence_snapshot_getter=confidence_snapshot_getter,
-        logging_enabled=logging_enabled,
-        device=device,
+    common = {
+        "confidence_snapshot_getter": confidence_snapshot_getter,
+        "logging_enabled": logging_enabled,
+        "device": device,
+    }
+    if mode == MODE:
+        return GaussianCandidateSelectorV2(**common)
+    return GaussianCandidateActiveFixedKV2(
+        **common,
+        strategy=_normalize_strategy(config.get("strategy", "evidence")),
+        fixed_k=_normalize_fixed_k(config.get("fixed_k", DEFAULT_FIXED_K)),
+        diversity_strength=_normalize_diversity_strength(
+            config.get("diversity_strength", DEFAULT_DIVERSITY_STRENGTH)
+        ),
     )
 
 
@@ -154,6 +218,32 @@ class CandidateMarginalUtilityTokenV2:
 
 @dataclass(frozen=True)
 class CandidateMarginalUtilitySummaryV2:
+    fields: dict[str, Any]
+
+    def to_event(self) -> dict[str, Any]:
+        return dict(self.fields)
+
+
+@dataclass(frozen=True)
+class CandidateActiveSelectionTokenV2:
+    """Tensor-free fixed-budget event state finalized after extension."""
+
+    fields: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class CandidateActiveSelectionResultV2:
+    xyz: torch.Tensor
+    features: torch.Tensor
+    scales: torch.Tensor
+    rotations: torch.Tensor
+    opacities: torch.Tensor
+    selected_indices: Optional[torch.Tensor]
+    token: CandidateActiveSelectionTokenV2
+
+
+@dataclass(frozen=True)
+class CandidateActiveSelectionSummaryV2:
     fields: dict[str, Any]
 
     def to_event(self) -> dict[str, Any]:
@@ -805,6 +895,886 @@ class GaussianCandidateSelectorV2:
                     "status": "error",
                     "reason": "event_serialization_failed",
                     "selected_indices_created": False,
+                    "error": _structured_error(error),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+        print(f"{LOG_PREFIX} {payload}", flush=True)
+
+
+class GaussianCandidateActiveFixedKV2(GaussianCandidateSelectorV2):
+    """Select a fixed number of candidates from existing event evidence.
+
+    This class deliberately does not call a renderer and does not reuse the
+    observe-only quantile path.  Projected-cell diversity is an empirical,
+    current-batch source-view confidence-cell penalty; it is not an existing-
+    map/global redundancy model or a rate-distortion objective.
+    ``diversity_strength`` is an experimental initial value; it is neither
+    frozen nor claimed to be theoretically optimal.
+    """
+
+    mode = ACTIVE_FIXED_K_MODE
+    is_active = True
+
+    def __init__(
+        self,
+        *,
+        confidence_snapshot_getter: Callable[..., Any],
+        logging_enabled: bool,
+        device: Any,
+        strategy: str,
+        fixed_k: int = DEFAULT_FIXED_K,
+        diversity_strength: float = DEFAULT_DIVERSITY_STRENGTH,
+    ) -> None:
+        super().__init__(
+            confidence_snapshot_getter=confidence_snapshot_getter,
+            logging_enabled=logging_enabled,
+            device=device,
+        )
+        self.strategy = _normalize_strategy(strategy)
+        self.fixed_k = _normalize_fixed_k(fixed_k)
+        self.diversity_strength = _normalize_diversity_strength(
+            diversity_strength
+        )
+
+    @staticmethod
+    def _validate_active_candidates(
+        *,
+        xyz: torch.Tensor,
+        features: torch.Tensor,
+        scales: torch.Tensor,
+        rotations: torch.Tensor,
+        opacities: torch.Tensor,
+    ) -> tuple[int, dict[str, torch.Tensor]]:
+        return GaussianCandidateActiveTopKV1._validate_active_candidate_contract(
+            xyz=xyz,
+            features=features,
+            scales=scales,
+            rotations=rotations,
+            opacities=opacities,
+        )
+
+    @staticmethod
+    def _active_intrinsics(
+        camera: Any,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        values = (camera.fx, camera.fy, camera.cx, camera.cy)
+        for name, value in zip(("fx", "fy", "cx", "cy"), values):
+            if isinstance(value, torch.Tensor) and value.numel() != 1:
+                raise ActiveConfidenceEvidenceError(
+                    "invalid_camera_projection",
+                    f"Camera {name} must be one scalar.",
+                )
+        has_device_tensor = any(
+            isinstance(value, torch.Tensor) and value.device.type != "cpu"
+            for value in values
+        )
+        if has_device_tensor:
+            scalars = tuple(
+                torch.as_tensor(value, device=device, dtype=dtype).reshape(())
+                for value in values
+            )
+            return torch.stack(scalars)
+        host_scalars = tuple(
+            torch.as_tensor(
+                value.detach() if isinstance(value, torch.Tensor) else value,
+                device="cpu",
+                dtype=dtype,
+            ).reshape(())
+            for value in values
+        )
+        return torch.stack(host_scalars).to(device=device)
+
+    @classmethod
+    def _active_project(
+        cls,
+        xyz: torch.Tensor,
+        camera: Any,
+    ) -> dict[str, torch.Tensor]:
+        pose = getattr(camera, "pose", None)
+        if not isinstance(pose, torch.Tensor) or tuple(pose.shape) != (4, 4):
+            raise ActiveConfidenceEvidenceError(
+                "invalid_camera_projection",
+                "Camera pose must be a [4,4] W2C tensor.",
+            )
+        pose = pose.detach().to(device=xyz.device, dtype=xyz.dtype)
+        intrinsics = cls._active_intrinsics(
+            camera,
+            device=xyz.device,
+            dtype=xyz.dtype,
+        )
+        camera_xyz = xyz @ pose[:3, :3].transpose(0, 1) + pose[:3, 3]
+        z = camera_xyz[:, 2]
+        positive_z = z > 0
+        safe_z = torch.where(positive_z, z, torch.ones_like(z))
+        fx, fy, cx, cy = intrinsics.unbind()
+        u_float = fx * camera_xyz[:, 0] / safe_z + cx
+        v_float = fy * camera_xyz[:, 1] / safe_z + cy
+        coordinates_finite = torch.isfinite(u_float) & torch.isfinite(v_float)
+        safe_u = torch.where(coordinates_finite, u_float, torch.zeros_like(u_float))
+        safe_v = torch.where(coordinates_finite, v_float, torch.zeros_like(v_float))
+        intrinsics_valid = torch.isfinite(intrinsics).all() & (fx > 0) & (fy > 0)
+        valid = (
+            torch.isfinite(pose).all()
+            & intrinsics_valid
+            & torch.isfinite(camera_xyz).all(dim=1)
+            & positive_z
+            & coordinates_finite
+        )
+        return {
+            "u": torch.round(safe_u).to(dtype=torch.long),
+            "v": torch.round(safe_v).to(dtype=torch.long),
+            "z": z,
+            "valid": valid,
+        }
+
+    @staticmethod
+    def _active_source_depth(
+        camera: Any,
+        depthmap: Any,
+        depth_source: str,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if depth_source == "explicit_depthmap":
+            source = depthmap
+        elif depth_source == "estimated_clean_depth":
+            source = getattr(camera, "depth", None)
+        elif depth_source == "depth_prior":
+            source = getattr(camera, "depth_prior", None)
+        else:
+            raise ActiveConfidenceEvidenceError(
+                "source_depth_unavailable",
+                f"Unsupported depth_source={depth_source!r}.",
+            )
+        if source is None:
+            raise ActiveConfidenceEvidenceError(
+                "source_depth_unavailable",
+                f"Source depth is missing for depth_source={depth_source!r}.",
+            )
+        source = torch.as_tensor(source, device=device, dtype=dtype).detach()
+        if source.ndim != 2:
+            raise ActiveConfidenceEvidenceError(
+                "source_depth_shape_mismatch",
+                f"Source depth must have shape [H,W], got {list(source.shape)}.",
+            )
+        return source
+
+    def _active_confidence_components(
+        self,
+        *,
+        xyz: torch.Tensor,
+        camera: Any,
+        depthmap: Any,
+        depth_source: str,
+        projection: Mapping[str, torch.Tensor],
+    ) -> dict[str, Any]:
+        source_frame_id = getattr(camera, "source_frame_id", None)
+        source_timestamp = getattr(camera, "source_timestamp", None)
+        buffer_index = getattr(camera, "buffer_index", None)
+        if source_frame_id is None or source_timestamp is None or buffer_index is None:
+            raise ActiveConfidenceEvidenceError(
+                "missing_confidence",
+                "Camera has no complete immutable confidence identity.",
+            )
+        try:
+            snapshot = self._confidence_snapshot_getter(
+                camera,
+                require_current=True,
+                upsampled=False,
+            )
+        except Exception as error:
+            reason = _known_snapshot_failure(error)
+            if reason is None:
+                raise
+            raise ActiveConfidenceEvidenceError(reason, str(error)) from error
+
+        try:
+            identity_checks = (
+                int(snapshot.buffer_index) == int(buffer_index),
+                int(snapshot.source_frame_id) == int(source_frame_id),
+                float(snapshot.source_timestamp) == float(source_timestamp),
+                int(snapshot.confidence_source_frame_id) == int(source_frame_id),
+            )
+        except (AttributeError, TypeError, ValueError, OverflowError) as error:
+            raise ActiveConfidenceEvidenceError(
+                "missing_confidence",
+                "Confidence snapshot identity metadata is incomplete.",
+            ) from error
+        if not all(identity_checks):
+            raise ActiveConfidenceEvidenceError(
+                "confidence_identity_mismatch",
+                "Confidence snapshot identity does not match the source Camera.",
+            )
+        if (
+            not bool(getattr(snapshot, "is_current", False))
+            or bool(getattr(snapshot, "is_stale", True))
+            or int(getattr(snapshot, "confidence_version", 0)) <= 0
+        ):
+            raise ActiveConfidenceEvidenceError(
+                "stale_confidence",
+                "Confidence snapshot is stale.",
+            )
+        confidence = getattr(snapshot, "confidence", None)
+        if not isinstance(confidence, torch.Tensor):
+            raise ActiveConfidenceEvidenceError(
+                "missing_confidence",
+                "Confidence snapshot contains no tensor.",
+            )
+        if confidence.ndim != 2 or tuple(getattr(snapshot, "shape", ())) != tuple(confidence.shape):
+            raise ActiveConfidenceEvidenceError(
+                "confidence_shape_mismatch",
+                "Confidence tensor or snapshot shape metadata is invalid.",
+            )
+        if confidence.device != xyz.device or str(getattr(snapshot, "device", None)) != str(confidence.device):
+            raise ActiveConfidenceEvidenceError(
+                "confidence_device_mismatch",
+                "Confidence/candidate device or metadata mismatch.",
+            )
+        if (
+            not confidence.dtype.is_floating_point
+            or str(getattr(snapshot, "dtype", None)) != str(confidence.dtype)
+        ):
+            raise ActiveConfidenceEvidenceError(
+                "confidence_dtype_mismatch",
+                "Confidence dtype or metadata is invalid.",
+            )
+        if bool(getattr(snapshot, "requires_grad", not confidence.requires_grad)) != bool(confidence.requires_grad):
+            raise ActiveConfidenceEvidenceError(
+                "confidence_requires_grad_mismatch",
+                "Confidence requires_grad metadata mismatch.",
+            )
+
+        source_depth = self._active_source_depth(
+            camera,
+            depthmap,
+            depth_source,
+            device=xyz.device,
+            dtype=xyz.dtype,
+        )
+        source_height, source_width = map(int, source_depth.shape)
+        camera_shape = (int(camera.image_height), int(camera.image_width))
+        if (source_height, source_width) != camera_shape:
+            raise ActiveConfidenceEvidenceError(
+                "source_depth_camera_shape_mismatch",
+                "Source depth and Camera image shapes differ.",
+            )
+        u = projection["u"]
+        v = projection["v"]
+        z = projection["z"]
+        source_in_bounds = (
+            projection["valid"]
+            & (u >= 0)
+            & (u < source_width)
+            & (v >= 0)
+            & (v < source_height)
+        )
+        safe_u = torch.clamp(u, 0, source_width - 1)
+        safe_v = torch.clamp(v, 0, source_height - 1)
+        sampled_depth = source_depth[safe_v, safe_u]
+        depth_tolerance = 1.0e-3 + 1.0e-3 * torch.abs(z)
+        lineage_valid = (
+            source_in_bounds
+            & torch.isfinite(sampled_depth)
+            & (sampled_depth > 0)
+            & (torch.abs(sampled_depth - z) <= depth_tolerance)
+        )
+
+        confidence_height, confidence_width = map(int, confidence.shape)
+        confidence_u = torch.div(
+            u * confidence_width,
+            source_width,
+            rounding_mode="floor",
+        )
+        confidence_v = torch.div(
+            v * confidence_height,
+            source_height,
+            rounding_mode="floor",
+        )
+        cell_in_bounds = (
+            source_in_bounds
+            & (confidence_u >= 0)
+            & (confidence_u < confidence_width)
+            & (confidence_v >= 0)
+            & (confidence_v < confidence_height)
+        )
+        safe_confidence_u = torch.clamp(confidence_u, 0, confidence_width - 1)
+        safe_confidence_v = torch.clamp(confidence_v, 0, confidence_height - 1)
+        sampled = confidence[safe_confidence_v, safe_confidence_u]
+        valid = lineage_valid & cell_in_bounds & torch.isfinite(sampled)
+        normalized = torch.clamp(sampled / CONFIDENCE_NORMALIZER, 0.0, 1.0)
+        cell_ids = confidence_v * confidence_width + confidence_u
+        return {
+            "raw": sampled,
+            "normalized": normalized,
+            "valid": valid,
+            "cell_ids": cell_ids,
+            "cell_valid": cell_in_bounds,
+            "metadata": {
+                "confidence_version": int(snapshot.confidence_version),
+                "confidence_source_frame_id": int(
+                    snapshot.confidence_source_frame_id
+                ),
+                "confidence_sampling_method": CONFIDENCE_SAMPLING_METHOD,
+                "source_resolution": [source_height, source_width],
+                "confidence_resolution": [
+                    confidence_height,
+                    confidence_width,
+                ],
+            },
+        }
+
+    def _active_render_components(
+        self,
+        *,
+        xyz: torch.Tensor,
+        camera: Any,
+        gaussian_before: int,
+        mapper_update_id: int,
+        evidence: Optional[PreinsertRenderEvidenceV1],
+        projection: Mapping[str, torch.Tensor],
+    ) -> tuple[Optional[dict[str, torch.Tensor]], str]:
+        if evidence is None:
+            return None, "missing_preinsert_render_evidence"
+        try:
+            evidence.validate_for_event(
+                camera=camera,
+                gaussian_count_current=gaussian_before,
+                mapper_update_id=mapper_update_id,
+            )
+        except PreinsertRenderEvidenceError:
+            return None, "invalid_preinsert_render_evidence"
+        if not evidence.available:
+            return None, str(evidence.unavailable_reason)
+
+        height, width = int(evidence.height), int(evidence.width)
+        u = projection["u"]
+        v = projection["v"]
+        z = projection["z"]
+        in_bounds = (
+            projection["valid"]
+            & (u >= 0)
+            & (u < width)
+            & (v >= 0)
+            & (v < height)
+        )
+        safe_u = torch.clamp(u, 0, width - 1)
+        safe_v = torch.clamp(v, 0, height - 1)
+        mask = self._mask(camera, device=xyz.device, height=height, width=width)
+        mask_sampled = mask[safe_v, safe_u]
+        alpha_raw = evidence.alpha_accum[0, safe_v, safe_u]
+        alpha_valid = in_bounds & torch.isfinite(alpha_raw)
+        alpha = torch.clamp(alpha_raw, 0.0, 1.0)
+        coverage = 1.0 - alpha
+        residual_domain = alpha_valid & mask_sampled
+
+        render_rgb = evidence.render_rgb[:, safe_v, safe_u].transpose(0, 1)
+        original = getattr(camera, "original_image", None)
+        if (
+            not isinstance(original, torch.Tensor)
+            or original.device != xyz.device
+            or tuple(original.shape) != (3, height, width)
+        ):
+            rgb_valid = torch.zeros_like(alpha_valid)
+            rgb_l1 = torch.zeros_like(alpha)
+        else:
+            original_sampled = (
+                original[:, safe_v, safe_u]
+                .transpose(0, 1)
+                .to(dtype=render_rgb.dtype)
+                / 255.0
+            )
+            rgb_l1 = torch.mean(torch.abs(render_rgb - original_sampled), dim=1)
+            rgb_valid = (
+                residual_domain
+                & torch.isfinite(render_rgb).all(dim=1)
+                & torch.isfinite(original_sampled).all(dim=1)
+                & torch.isfinite(rgb_l1)
+            )
+        rgb_l1 = torch.clamp(rgb_l1, 0.0, 1.0)
+
+        depth_accum = evidence.depth_accum[0, safe_v, safe_u]
+        old_depth = depth_accum / torch.clamp(alpha, min=NUMERICAL_EPSILON)
+        depth_relative_error = torch.abs(old_depth - z) / torch.clamp(
+            z,
+            min=NUMERICAL_EPSILON,
+        )
+        depth_valid = (
+            residual_domain
+            & (alpha > 0)
+            & torch.isfinite(depth_accum)
+            & torch.isfinite(old_depth)
+            & (old_depth > 0)
+            & torch.isfinite(z)
+            & (z > 0)
+            & torch.isfinite(depth_relative_error)
+        )
+        depth_saturated = depth_relative_error / (1.0 + depth_relative_error)
+        return {
+            "alpha": alpha,
+            "coverage": coverage,
+            "coverage_valid": alpha_valid,
+            "rgb_l1": rgb_l1,
+            "rgb_valid": rgb_valid,
+            "depth_saturated": depth_saturated,
+            "depth_valid": depth_valid,
+        }, "available"
+
+    @staticmethod
+    def _stable_topk(scores: torch.Tensor, fixed_k: int) -> torch.Tensor:
+        ranked = torch.argsort(-scores, stable=True)
+        return torch.sort(ranked[:fixed_k]).values
+
+    @staticmethod
+    def _index_candidates(
+        tensors: Mapping[str, torch.Tensor],
+        selected_indices: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        return {
+            name: torch.index_select(value, 0, selected_indices)
+            for name, value in tensors.items()
+        }
+
+    @staticmethod
+    def _count_active(mask: torch.Tensor) -> int:
+        return int(torch.count_nonzero(mask).detach().item())
+
+    @staticmethod
+    def _weighted_evidence_quality(
+        render_components: Mapping[str, torch.Tensor],
+        confidence_components: Mapping[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return continuous alpha-supported evidence quality on-device."""
+
+        coverage_valid = render_components["coverage_valid"]
+        rgb_valid = render_components["rgb_valid"] & confidence_components[
+            "valid"
+        ]
+        depth_valid = render_components["depth_valid"] & confidence_components[
+            "valid"
+        ]
+        alpha = render_components["alpha"]
+        confidence = confidence_components["normalized"]
+        zeros = torch.zeros_like(render_components["coverage"])
+        numerator = torch.where(
+            coverage_valid,
+            render_components["coverage"],
+            zeros,
+        )
+        denominator = coverage_valid.to(dtype=numerator.dtype)
+        numerator = numerator + torch.where(
+            rgb_valid,
+            alpha * confidence * render_components["rgb_l1"],
+            zeros,
+        )
+        denominator = denominator + alpha * rgb_valid.to(dtype=alpha.dtype)
+        numerator = numerator + torch.where(
+            depth_valid,
+            alpha * confidence * render_components["depth_saturated"],
+            zeros,
+        )
+        denominator = denominator + alpha * depth_valid.to(dtype=alpha.dtype)
+        score_valid = denominator > 0
+        quality = torch.where(
+            score_valid,
+            numerator / torch.clamp(denominator, min=NUMERICAL_EPSILON),
+            zeros,
+        )
+        return quality, score_valid, rgb_valid, depth_valid
+
+    def _projected_cell_scores(
+        self,
+        quality: torch.Tensor,
+        *,
+        cell_ids: torch.Tensor,
+        cell_valid: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply an empirical current-batch projected-cell rank penalty."""
+        candidate_count = int(quality.shape[0])
+        original_indices = torch.arange(
+            candidate_count,
+            dtype=torch.long,
+            device=quality.device,
+        )
+        invalid_unique_cells = cell_ids.amax() + 1 + original_indices
+        grouping_cells = torch.where(cell_valid, cell_ids, invalid_unique_cells)
+        quality_order = torch.argsort(-quality, stable=True)
+        grouped_order = quality_order[
+            torch.argsort(grouping_cells[quality_order], stable=True)
+        ]
+        grouped_cells = grouping_cells[grouped_order]
+        positions = torch.arange(
+            candidate_count,
+            dtype=torch.long,
+            device=quality.device,
+        )
+        starts = torch.ones(
+            candidate_count,
+            dtype=torch.bool,
+            device=quality.device,
+        )
+        starts[1:] = grouped_cells[1:] != grouped_cells[:-1]
+        start_positions = torch.where(starts, positions, torch.zeros_like(positions))
+        last_start = torch.cummax(start_positions, dim=0).values
+        rank = (positions - last_start + 1).to(dtype=quality.dtype)
+        rank_penalty = self.diversity_strength * (1.0 - torch.reciprocal(rank))
+        adjusted = quality.clone()
+        adjusted[grouped_order] = quality[grouped_order] - rank_penalty
+        return adjusted
+
+    def _active_base_fields(
+        self,
+        *,
+        camera: Any,
+        mapper_update_id: int,
+        candidate_count: int,
+        gaussian_before: int,
+        init: bool,
+    ) -> dict[str, Any]:
+        sequence = self._next_event_sequence()
+        identity = self._camera_identity_fields(camera)
+        return {
+            "schema": SCHEMA_VERSION,
+            "event_type": "candidate_active_selection_v2",
+            "event_id": (
+                f"gcs-v2-active:{sequence}:{mapper_update_id}:"
+                f"{identity['source_camera_id']}"
+            ),
+            "event_sequence": sequence,
+            "mode": ACTIVE_FIXED_K_MODE,
+            "strategy": self.strategy,
+            "fixed_k": self.fixed_k,
+            "diversity_strength": self.diversity_strength,
+            "candidate_count": candidate_count,
+            "selected_count": candidate_count,
+            "selected_unique_cell_count": None,
+            "fallback_reason": None,
+            "alpha_valid_count": 0,
+            "coverage_valid_count": 0,
+            "confidence_valid_count": 0,
+            "rgb_l1_valid_count": 0,
+            "depth_relative_error_valid_count": 0,
+            "cell_valid_count": 0,
+            "multiplicity_valid_count": 0,
+            "cell_redundancy_valid_count": 0,
+            "selector_wall_time_ms": 0.0,
+            "init_bypass": bool(init),
+            "selected_indices_created": False,
+            "gaussian_before": int(gaussian_before),
+            "gaussian_after_extend": None,
+            "actual_admitted_count": None,
+            "actual_dropped_count": None,
+            "m01_second_selection_applied": False,
+            "conservation_check": None,
+            "status": "ok",
+            "reason": None,
+            "error": None,
+            **identity,
+        }
+
+    def select_before_extend(
+        self,
+        *,
+        xyz: torch.Tensor,
+        features: torch.Tensor,
+        scales: torch.Tensor,
+        rotations: torch.Tensor,
+        opacities: torch.Tensor,
+        camera: Any,
+        depthmap: Any,
+        depth_source: str,
+        mapper_update_id: int,
+        init: bool,
+        gaussian_before: int,
+        preinsert_render_evidence: Optional[PreinsertRenderEvidenceV1],
+    ) -> CandidateActiveSelectionResultV2:
+        started_ns = time.perf_counter_ns()
+        candidate_count, tensors = self._validate_active_candidates(
+            xyz=xyz,
+            features=features,
+            scales=scales,
+            rotations=rotations,
+            opacities=opacities,
+        )
+        input_state = self._tensor_state(tensors)
+        fields = self._active_base_fields(
+            camera=camera,
+            mapper_update_id=mapper_update_id,
+            candidate_count=candidate_count,
+            gaussian_before=gaussian_before,
+            init=init,
+        )
+        selected_indices: Optional[torch.Tensor] = None
+        output = tensors
+
+        if init:
+            fields["reason"] = "init_bypass"
+        elif candidate_count <= self.fixed_k:
+            fields["reason"] = (
+                "empty_candidate" if candidate_count == 0 else "keep_all_n_le_k"
+            )
+        else:
+            projection = self._active_project(xyz, camera)
+            render_components, evidence_reason = self._active_render_components(
+                xyz=xyz,
+                camera=camera,
+                gaussian_before=gaussian_before,
+                mapper_update_id=mapper_update_id,
+                evidence=preinsert_render_evidence,
+                projection=projection,
+            )
+            confidence_components = None
+            confidence_reason = "not_required"
+            if self.strategy != "coverage":
+                try:
+                    confidence_components = self._active_confidence_components(
+                        xyz=xyz,
+                        camera=camera,
+                        depthmap=depthmap,
+                        depth_source=depth_source,
+                        projection=projection,
+                    )
+                except ActiveConfidenceEvidenceError as error:
+                    confidence_reason = error.reason
+                else:
+                    confidence_reason = "current"
+
+            uniform = deterministic_uniform_indices(
+                candidate_count=candidate_count,
+                fixed_budget=self.fixed_k,
+                device=xyz.device,
+            )
+            negative_infinity = torch.full(
+                (candidate_count,),
+                -torch.inf,
+                dtype=xyz.dtype,
+                device=xyz.device,
+            )
+            coverage_valid_count = 0
+            confidence_valid_count = 0
+            rgb_valid_count = 0
+            depth_valid_count = 0
+            cell_valid_count = 0
+
+            if render_components is not None:
+                coverage_valid_count = self._count_active(
+                    render_components["coverage_valid"]
+                )
+                rgb_valid_count = self._count_active(render_components["rgb_valid"])
+                depth_valid_count = self._count_active(
+                    render_components["depth_valid"]
+                )
+            if confidence_components is not None:
+                confidence_valid_count = self._count_active(
+                    confidence_components["valid"]
+                )
+                cell_valid_count = self._count_active(
+                    confidence_components["cell_valid"]
+                )
+            render_usable = (
+                render_components is not None and coverage_valid_count > 0
+            )
+            if render_components is not None and not render_usable:
+                evidence_reason = "no_valid_coverage"
+
+            if self.strategy == "coverage":
+                if not render_usable:
+                    selected_indices = uniform
+                    fields["fallback_reason"] = evidence_reason
+                    fields["reason"] = "deterministic_uniform_fallback"
+                else:
+                    scores = torch.where(
+                        render_components["coverage_valid"],
+                        render_components["coverage"],
+                        negative_infinity,
+                    )
+                    selected_indices = self._stable_topk(scores, self.fixed_k)
+                    fields["reason"] = "coverage_fixed_k"
+            elif not render_usable:
+                if confidence_components is None or confidence_valid_count == 0:
+                    selected_indices = uniform
+                    fields["fallback_reason"] = (
+                        f"{evidence_reason}+{confidence_reason}"
+                    )
+                    fields["reason"] = "deterministic_uniform_fallback"
+                else:
+                    scores = torch.where(
+                        confidence_components["valid"],
+                        confidence_components["raw"],
+                        negative_infinity,
+                    )
+                    selected_indices = self._stable_topk(scores, self.fixed_k)
+                    fields["fallback_reason"] = evidence_reason
+                    fields["reason"] = "confidence_topk_fallback"
+            elif confidence_components is None or confidence_valid_count == 0:
+                if coverage_valid_count == 0:
+                    selected_indices = uniform
+                    fields["fallback_reason"] = (
+                        f"invalid_coverage+{confidence_reason}"
+                    )
+                    fields["reason"] = "deterministic_uniform_fallback"
+                else:
+                    scores = torch.where(
+                        render_components["coverage_valid"],
+                        render_components["coverage"],
+                        negative_infinity,
+                    )
+                    selected_indices = self._stable_topk(scores, self.fixed_k)
+                    fields["fallback_reason"] = confidence_reason
+                    fields["reason"] = "coverage_only_fallback"
+            else:
+                quality, score_valid, _, _ = self._weighted_evidence_quality(
+                    render_components,
+                    confidence_components,
+                )
+                quality = torch.where(score_valid, quality, negative_infinity)
+                if self.strategy == "evidence_projected_cell":
+                    quality = self._projected_cell_scores(
+                        quality,
+                        cell_ids=confidence_components["cell_ids"],
+                        cell_valid=confidence_components["cell_valid"],
+                    )
+                selected_indices = self._stable_topk(quality, self.fixed_k)
+                fields["reason"] = f"{self.strategy}_fixed_k"
+
+            output = self._index_candidates(tensors, selected_indices)
+            fields.update(
+                {
+                    "selected_count": int(selected_indices.shape[0]),
+                    "selected_indices_created": True,
+                    "alpha_valid_count": coverage_valid_count,
+                    "coverage_valid_count": coverage_valid_count,
+                    "confidence_valid_count": confidence_valid_count,
+                    "rgb_l1_valid_count": rgb_valid_count,
+                    "depth_relative_error_valid_count": depth_valid_count,
+                    "cell_valid_count": cell_valid_count,
+                    "multiplicity_valid_count": cell_valid_count,
+                    "cell_redundancy_valid_count": cell_valid_count,
+                }
+            )
+            if confidence_components is not None:
+                selected_cells = confidence_components["cell_ids"][selected_indices]
+                selected_cell_valid = confidence_components["cell_valid"][
+                    selected_indices
+                ]
+                fields["selected_unique_cell_count"] = int(
+                    torch.unique(selected_cells[selected_cell_valid]).shape[0]
+                )
+
+        if self._tensor_state(tensors) != input_state:
+            raise RuntimeError("GCS-v2 active selector mutated candidate inputs.")
+        retained = int(output["xyz"].shape[0])
+        if any(int(value.shape[0]) != retained for value in output.values()):
+            raise RuntimeError("GCS-v2 selected candidate fields are misaligned.")
+        fields["selected_count"] = retained
+        elapsed_ms = (time.perf_counter_ns() - started_ns) / 1_000_000.0
+        fields["selector_wall_time_ms"] = (
+            elapsed_ms if math.isfinite(elapsed_ms) else None
+        )
+        return CandidateActiveSelectionResultV2(
+            xyz=output["xyz"],
+            features=output["features"],
+            scales=output["scales"],
+            rotations=output["rotations"],
+            opacities=output["opacities"],
+            selected_indices=selected_indices,
+            token=CandidateActiveSelectionTokenV2(fields=fields),
+        )
+
+    def observe_active_empty(
+        self,
+        *,
+        camera: Any,
+        mapper_update_id: int,
+        init: bool,
+        gaussian_before: int,
+    ) -> CandidateActiveSelectionTokenV2:
+        fields = self._active_base_fields(
+            camera=camera,
+            mapper_update_id=mapper_update_id,
+            candidate_count=0,
+            gaussian_before=gaussian_before,
+            init=init,
+        )
+        fields["reason"] = "init_bypass" if init else "empty_candidate"
+        return CandidateActiveSelectionTokenV2(fields=fields)
+
+    def record_active_after_extend(
+        self,
+        token: CandidateActiveSelectionTokenV2,
+        *,
+        admitted_candidate_count: int,
+        dropped_candidate_count: int,
+        gaussian_after_extend: int,
+        m01_second_selection_applied: bool,
+    ) -> CandidateActiveSelectionSummaryV2:
+        fields = dict(token.fields)
+        admitted = int(admitted_candidate_count)
+        gaussian_after = int(gaussian_after_extend)
+        second_selection = bool(m01_second_selection_applied)
+        conservation = (
+            admitted == int(fields["selected_count"])
+            and int(dropped_candidate_count) == 0
+            and gaussian_after == int(fields["gaussian_before"]) + admitted
+            and not second_selection
+        )
+        fields.update(
+            {
+                "actual_admitted_count": admitted,
+                "actual_dropped_count": int(fields["candidate_count"]) - admitted,
+                "gaussian_after_extend": gaussian_after,
+                "m01_second_selection_applied": second_selection,
+                "conservation_check": conservation,
+            }
+        )
+        if not conservation:
+            fields.update(
+                {
+                    "status": "error",
+                    "reason": "active_selection_conservation_failed",
+                    "error": {
+                        "type": "ActiveSelectionConservationError",
+                        "message": (
+                            "V2 fixed-K selection, M01 bypass, or Gaussian count "
+                            "conservation failed."
+                        ),
+                    },
+                }
+            )
+        summary = CandidateActiveSelectionSummaryV2(fields=fields)
+        if self.logging_enabled:
+            self._emit_active(summary.to_event())
+        return summary
+
+    @staticmethod
+    def _emit_active(event: dict[str, Any]) -> None:
+        try:
+            payload = json.dumps(
+                event,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+        except Exception as error:
+            payload = json.dumps(
+                {
+                    "schema": SCHEMA_VERSION,
+                    "event_type": "candidate_active_selection_v2",
+                    "event_id": event.get("event_id", "gcs-v2-active:fallback"),
+                    "event_sequence": event.get("event_sequence"),
+                    "mode": ACTIVE_FIXED_K_MODE,
+                    "strategy": event.get("strategy"),
+                    "fixed_k": event.get("fixed_k"),
+                    "candidate_count": event.get("candidate_count", 0),
+                    "selected_count": event.get("selected_count", 0),
+                    "status": "error",
+                    "reason": "active_event_serialization_failed",
                     "error": _structured_error(error),
                 },
                 sort_keys=True,

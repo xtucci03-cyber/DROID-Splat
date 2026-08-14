@@ -90,10 +90,16 @@ candidate_selector_v1:
   logging:
     enabled: true
 
-# Default-off GCS-v2 V2-A marginal-utility component diagnostics. Observe is
-# pass-through and requires GCS-v1/M01 off plus preinsert render evidence on.
+# Default-off GCS-v2 marginal-utility diagnostics/fixed-K experiments. Observe
+# is pass-through; non-off modes require GCS-v1/M01 off and preinsert evidence.
 candidate_selector_v2:
   mode: "off"
+  strategy: "evidence"
+  fixed_k: 600
+  # Experimental initial value for current-batch source-view projected
+  # confidence-cell diminishing returns. It is not frozen, global-map
+  # redundancy, or a theoretically optimal value.
+  diversity_strength: 0.1
   logging:
     enabled: true
 

@@ -20,8 +20,12 @@ from .gaussian_candidate_selector_v1 import (
     build_gaussian_candidate_selector_v1,
 )
 from .gaussian_candidate_selector_v2 import (
+    CandidateActiveSelectionResultV2,
+    CandidateActiveSelectionSummaryV2,
+    CandidateActiveSelectionTokenV2,
     CandidateMarginalUtilitySummaryV2,
     CandidateMarginalUtilityTokenV2,
+    GaussianCandidateActiveFixedKV2,
     GaussianCandidateSelectorV2,
     build_gaussian_candidate_selector_v2,
 )
@@ -45,8 +49,12 @@ __all__ = [
     "CandidateQualityEvidenceToken",
     "GaussianCandidateSelectorV1",
     "build_gaussian_candidate_selector_v1",
+    "CandidateActiveSelectionResultV2",
+    "CandidateActiveSelectionSummaryV2",
+    "CandidateActiveSelectionTokenV2",
     "CandidateMarginalUtilitySummaryV2",
     "CandidateMarginalUtilityTokenV2",
+    "GaussianCandidateActiveFixedKV2",
     "GaussianCandidateSelectorV2",
     "build_gaussian_candidate_selector_v2",
     "stable_quality_topk_indices",

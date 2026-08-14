@@ -612,6 +612,20 @@ class GaussianModel:
             candidate_selector_v1,
             GaussianCandidateActiveTopKV1,
         )
+        selector_v2_active = bool(
+            candidate_selector_v2 is not None
+            and getattr(candidate_selector_v2, "is_active", False)
+        )
+        if candidate_selector_v1 is not None and candidate_selector_v2 is not None:
+            raise RuntimeError(
+                "GCS-v1 and GCS-v2 selectors are mutually exclusive; refusing "
+                "a possible second selection or duplicate observation."
+            )
+        if selector_v2_active and self.resource_admission is not None:
+            raise RuntimeError(
+                "GCS-v2 active selection requires ResourceAdmission to be "
+                "disabled; refusing a possible second selection."
+            )
         if (
             candidate_selector_v1 is not None
             and candidate_observer is None
@@ -711,21 +725,47 @@ class GaussianModel:
                     )
 
             marginal_utility_token = None
+            marginal_utility_active_selection = None
             if candidate_selector_v2 is not None:
-                marginal_utility_token = candidate_selector_v2.observe_before_extend(
-                    xyz=fused_point_cloud,
-                    features=features,
-                    scales=scales,
-                    rotations=rots,
-                    opacities=opacities,
-                    camera=cam_info,
-                    depthmap=depthmap,
-                    depth_source=candidate_metadata.depth_source,
-                    mapper_update_id=mapper_update_id,
-                    init=init,
-                    gaussian_before=len(self),
-                    preinsert_render_evidence=preinsert_render_evidence,
-                )
+                if selector_v2_active:
+                    marginal_utility_active_selection = (
+                        candidate_selector_v2.select_before_extend(
+                            xyz=fused_point_cloud,
+                            features=features,
+                            scales=scales,
+                            rotations=rots,
+                            opacities=opacities,
+                            camera=cam_info,
+                            depthmap=depthmap,
+                            depth_source=candidate_metadata.depth_source,
+                            mapper_update_id=mapper_update_id,
+                            init=init,
+                            gaussian_before=len(self),
+                            preinsert_render_evidence=preinsert_render_evidence,
+                        )
+                    )
+                    fused_point_cloud = marginal_utility_active_selection.xyz
+                    features = marginal_utility_active_selection.features
+                    scales = marginal_utility_active_selection.scales
+                    rots = marginal_utility_active_selection.rotations
+                    opacities = marginal_utility_active_selection.opacities
+                else:
+                    marginal_utility_token = (
+                        candidate_selector_v2.observe_before_extend(
+                            xyz=fused_point_cloud,
+                            features=features,
+                            scales=scales,
+                            rotations=rots,
+                            opacities=opacities,
+                            camera=cam_info,
+                            depthmap=depthmap,
+                            depth_source=candidate_metadata.depth_source,
+                            mapper_update_id=mapper_update_id,
+                            init=init,
+                            gaussian_before=len(self),
+                            preinsert_render_evidence=preinsert_render_evidence,
+                        )
+                    )
 
             # OURS-M01: Candidate admission hook before persistent Gaussian insertion.
             if active_selection is not None and self.resource_admission is not None:
@@ -796,12 +836,21 @@ class GaussianModel:
                         gaussian_after_extend=len(self),
                     )
             if candidate_selector_v2 is not None:
-                candidate_selector_v2.record_after_extend(
-                    marginal_utility_token,
-                    admitted_candidate_count=admitted_candidate_count,
-                    dropped_candidate_count=dropped_candidate_count,
-                    gaussian_after_extend=len(self),
-                )
+                if marginal_utility_active_selection is not None:
+                    candidate_selector_v2.record_active_after_extend(
+                        marginal_utility_active_selection.token,
+                        admitted_candidate_count=admitted_candidate_count,
+                        dropped_candidate_count=dropped_candidate_count,
+                        gaussian_after_extend=len(self),
+                        m01_second_selection_applied=False,
+                    )
+                else:
+                    candidate_selector_v2.record_after_extend(
+                        marginal_utility_token,
+                        admitted_candidate_count=admitted_candidate_count,
+                        dropped_candidate_count=dropped_candidate_count,
+                        gaussian_after_extend=len(self),
+                    )
         else:
             print("No points in the point cloud")
             if candidate_observer is not None:
@@ -860,19 +909,36 @@ class GaussianModel:
                         gaussian_after_extend=len(self),
                     )
             if candidate_selector_v2 is not None:
-                marginal_utility_token = candidate_selector_v2.observe_empty(
-                    camera=cam_info,
-                    mapper_update_id=mapper_update_id,
-                    init=init,
-                    gaussian_before=len(self),
-                    preinsert_render_evidence=preinsert_render_evidence,
-                )
-                candidate_selector_v2.record_after_extend(
-                    marginal_utility_token,
-                    admitted_candidate_count=0,
-                    dropped_candidate_count=0,
-                    gaussian_after_extend=len(self),
-                )
+                if selector_v2_active:
+                    marginal_utility_token = (
+                        candidate_selector_v2.observe_active_empty(
+                            camera=cam_info,
+                            mapper_update_id=mapper_update_id,
+                            init=init,
+                            gaussian_before=len(self),
+                        )
+                    )
+                    candidate_selector_v2.record_active_after_extend(
+                        marginal_utility_token,
+                        admitted_candidate_count=0,
+                        dropped_candidate_count=0,
+                        gaussian_after_extend=len(self),
+                        m01_second_selection_applied=False,
+                    )
+                else:
+                    marginal_utility_token = candidate_selector_v2.observe_empty(
+                        camera=cam_info,
+                        mapper_update_id=mapper_update_id,
+                        init=init,
+                        gaussian_before=len(self),
+                        preinsert_render_evidence=preinsert_render_evidence,
+                    )
+                    candidate_selector_v2.record_after_extend(
+                        marginal_utility_token,
+                        admitted_candidate_count=0,
+                        dropped_candidate_count=0,
+                        gaussian_after_extend=len(self),
+                    )
 
     def prune_points(self, mask):
         valid_points_mask = ~mask

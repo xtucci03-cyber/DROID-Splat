@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import redirect_stdout
 import io
+import inspect
 import json
 import math
 from pathlib import Path
@@ -13,8 +14,13 @@ import torch
 
 from src.candidate_selection.gaussian_candidate_selector_v2 import (
     LOG_PREFIX,
+    NUMERICAL_EPSILON,
+    GaussianCandidateActiveFixedKV2,
     GaussianCandidateSelectorV2,
     build_gaussian_candidate_selector_v2,
+)
+from src.candidate_selection.gaussian_candidate_active_topk_v1 import (
+    GaussianCandidateActiveTopKV1,
 )
 from src.candidate_selection.preinsert_render_evidence_v1 import (
     PreinsertRenderEvidenceObserverV1,
@@ -207,6 +213,90 @@ class GaussianCandidateSelectorV2Tests(unittest.TestCase):
             ),
         )
 
+    def _active_selector(self, strategy, *, getter=None, fixed_k=2):
+        return GaussianCandidateActiveFixedKV2(
+            confidence_snapshot_getter=self.getter if getter is None else getter,
+            logging_enabled=False,
+            device="cpu",
+            strategy=strategy,
+            fixed_k=fixed_k,
+            diversity_strength=0.1,
+        )
+
+    def _select(
+        self,
+        strategy,
+        *,
+        evidence=None,
+        getter=None,
+        candidates=None,
+        init=False,
+        fixed_k=2,
+    ):
+        candidates = self.candidates if candidates is None else candidates
+        selector = self._active_selector(
+            strategy,
+            getter=getter,
+            fixed_k=fixed_k,
+        )
+        result = selector.select_before_extend(
+            xyz=candidates[0],
+            features=candidates[1],
+            scales=candidates[2],
+            rotations=candidates[3],
+            opacities=candidates[4],
+            camera=self.camera,
+            depthmap=None,
+            depth_source="estimated_clean_depth",
+            mapper_update_id=23,
+            init=init,
+            gaussian_before=11,
+            preinsert_render_evidence=(
+                self._evidence() if evidence is None else evidence
+            ),
+        )
+        return selector, result
+
+    def _weighted_quality(
+        self,
+        *,
+        alpha,
+        rgb_l1,
+        depth_saturated,
+        rgb_valid,
+        depth_valid,
+        confidence=1.0,
+    ):
+        alpha = torch.as_tensor(alpha, dtype=torch.float32).reshape(-1)
+        count = int(alpha.shape[0])
+        render_components = {
+            "alpha": alpha,
+            "coverage": 1.0 - alpha,
+            "coverage_valid": torch.ones(count, dtype=torch.bool),
+            "rgb_l1": torch.as_tensor(rgb_l1, dtype=torch.float32).reshape(-1),
+            "rgb_valid": torch.as_tensor(rgb_valid, dtype=torch.bool).reshape(-1),
+            "depth_saturated": torch.as_tensor(
+                depth_saturated,
+                dtype=torch.float32,
+            ).reshape(-1),
+            "depth_valid": torch.as_tensor(
+                depth_valid,
+                dtype=torch.bool,
+            ).reshape(-1),
+        }
+        confidence_components = {
+            "normalized": torch.full(
+                (count,),
+                float(confidence),
+                dtype=torch.float32,
+            ),
+            "valid": torch.ones(count, dtype=torch.bool),
+        }
+        return GaussianCandidateActiveFixedKV2._weighted_evidence_quality(
+            render_components,
+            confidence_components,
+        )
+
     def _mapper_init_config(self, *, v1_mode="off", v2_mode="observe", evidence_mode="observe", m01_mode="disabled"):
         online_opt = AttrConfig(
             batch_mode=False,
@@ -241,6 +331,9 @@ class GaussianCandidateSelectorV2Tests(unittest.TestCase):
             ),
             candidate_selector_v2=AttrConfig(
                 mode=v2_mode,
+                strategy="evidence",
+                fixed_k=600,
+                diversity_strength=0.1,
                 logging=AttrConfig(enabled=True),
             ),
             preinsert_render_evidence_v1=AttrConfig(mode=evidence_mode),
@@ -365,6 +458,8 @@ class GaussianCandidateSelectorV2Tests(unittest.TestCase):
             "preinsert_render_evidence_v1:", 1
         )[0]
         self.assertIn('mode: "off"', block)
+        self.assertIn('fixed_k: 600', block)
+        self.assertIn('diversity_strength: 0.1', block)
 
     def test_init_bypass_preserves_candidates_without_confidence(self):
         references = list(self.candidates)
@@ -582,9 +677,7 @@ class GaussianCandidateSelectorV2Tests(unittest.TestCase):
             torch.testing.assert_close(value, frozen, atol=0.0, rtol=0.0)
 
     def test_observer_has_no_index_select_or_renderer_api(self):
-        source = (
-            ROOT / "src/candidate_selection/gaussian_candidate_selector_v2.py"
-        ).read_text(encoding="utf-8")
+        source = inspect.getsource(GaussianCandidateSelectorV2)
         self.assertNotIn("index_select", source)
         self.assertNotIn("gaussian_renderer", source)
         self.assertNotIn("renderer(", source)
@@ -803,6 +896,542 @@ class GaussianCandidateSelectorV2Tests(unittest.TestCase):
         self.assertEqual(harness.extend_calls, 1)
         self.assertEqual(harness.last_extended_count, 4)
         self.assertEqual([value.data_ptr() for value in self.candidates], pointers)
+
+    def test_active_factory_contract_and_mutual_exclusion(self):
+        config = {
+            "mode": "active_fixed_k",
+            "strategy": "evidence_projected_cell",
+            "fixed_k": 600,
+            "diversity_strength": 0.1,
+            "logging": {"enabled": True},
+        }
+        kwargs = dict(
+            candidate_selector_v1=None,
+            resource_admission_mode="disabled",
+            preinsert_render_evidence_v1=SimpleNamespace(mode="observe"),
+            confidence_snapshot_getter=self.getter,
+            device="cpu",
+        )
+        selector = build_gaussian_candidate_selector_v2(config, **kwargs)
+        self.assertIsInstance(selector, GaussianCandidateActiveFixedKV2)
+        self.assertTrue(selector.is_active)
+        self.assertEqual(selector.fixed_k, 600)
+        self.assertEqual(selector.strategy, "evidence_projected_cell")
+        for key, value, message in (
+            ("candidate_selector_v1", object(), "candidate_selector_v1.mode=off"),
+            ("resource_admission_mode", "fixed_budget", "resource_admission.mode=disabled"),
+            ("preinsert_render_evidence_v1", None, "preinsert_render_evidence_v1.mode=observe"),
+        ):
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, message):
+                build_gaussian_candidate_selector_v2(
+                    config,
+                    **{**kwargs, key: value},
+                )
+        with self.assertRaisesRegex(ValueError, "strategy must be one of"):
+            build_gaussian_candidate_selector_v2(
+                {**config, "strategy": "unknown"},
+                **kwargs,
+            )
+
+    def test_active_coverage_ranking_ignores_confidence(self):
+        getter = SnapshotGetter(
+            torch.tensor([[SQRT_2, 0.0]], dtype=torch.float32)
+        )
+        selector, result = self._select("coverage", getter=getter)
+        self.assertEqual(result.selected_indices.tolist(), [0, 1])
+        self.assertEqual(getter.calls, 0)
+        self.assertEqual(result.token.fields["reason"], "coverage_fixed_k")
+        self.assertEqual(result.token.fields["selected_count"], 2)
+        self.assertIsNone(result.token.fields["fallback_reason"])
+        self.assertEqual(selector.strategy, "coverage")
+
+    def test_active_evidence_formula_ranks_valid_component_weighted_mean(self):
+        confidence = torch.full((1, 4), SQRT_2, dtype=torch.float32)
+        getter = SnapshotGetter(confidence)
+        alpha = torch.full((1, self.height, self.width), 0.5)
+        depth = 2.0 * alpha
+        depth[0, 0, 1] = 4.0 * alpha[0, 0, 1]
+        rgb = torch.zeros(3, self.height, self.width)
+        rgb[:, 0, 2] = 1.0
+        _, result = self._select(
+            "evidence",
+            getter=getter,
+            evidence=self._evidence(alpha=alpha, depth=depth, rgb=rgb),
+        )
+        self.assertEqual(result.selected_indices.tolist(), [1, 2])
+        self.assertEqual(result.token.fields["reason"], "evidence_fixed_k")
+        self.assertEqual(result.token.fields["coverage_valid_count"], 4)
+        self.assertEqual(result.token.fields["rgb_l1_valid_count"], 4)
+        self.assertEqual(
+            result.token.fields["depth_relative_error_valid_count"], 4
+        )
+
+    def test_active_projection_and_lowres_cells_match_frozen_v1_semantics(self):
+        selector = self._active_selector("evidence")
+        projection = selector._active_project(self.candidates[0], self.camera)
+        frozen_u, frozen_v, frozen_z, frozen_valid = (
+            GaussianCandidateActiveTopKV1.project_world_to_source_pixels(
+                selector,
+                self.candidates[0],
+                self.camera,
+            )
+        )
+        torch.testing.assert_close(projection["u"], frozen_u)
+        torch.testing.assert_close(projection["v"], frozen_v)
+        torch.testing.assert_close(projection["z"], frozen_z)
+        torch.testing.assert_close(projection["valid"], frozen_valid)
+        components = selector._active_confidence_components(
+            xyz=self.candidates[0],
+            camera=self.camera,
+            depthmap=None,
+            depth_source="estimated_clean_depth",
+            projection=projection,
+        )
+        frozen_conf_u, frozen_conf_v, _, _ = (
+            GaussianCandidateActiveTopKV1.map_source_pixels_to_confidence(
+                frozen_u,
+                frozen_v,
+                source_resolution=(self.height, self.width),
+                confidence_resolution=tuple(self.confidence.shape),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                components["cell_ids"],
+                frozen_conf_v * self.confidence.shape[1] + frozen_conf_u,
+            )
+        )
+
+    def test_projected_cell_diminishing_returns_changes_only_winner_identity(self):
+        alpha = torch.tensor(
+            [[[0.10, 0.102, 0.11, 1.0], [0.0, 0.0, 0.0, 0.0]]]
+        )
+        evidence = self._evidence(alpha=alpha, depth=2.0 * alpha)
+        _, evidence_result = self._select("evidence", evidence=evidence)
+        _, diversity_result = self._select(
+            "evidence_projected_cell",
+            evidence=evidence,
+        )
+        self.assertEqual(evidence_result.selected_indices.tolist(), [0, 1])
+        self.assertEqual(diversity_result.selected_indices.tolist(), [0, 2])
+        self.assertEqual(
+            diversity_result.token.fields["selected_unique_cell_count"], 2
+        )
+        self.assertEqual(diversity_result.selected_indices.numel(), 2)
+
+    def test_low_alpha_continuously_downweights_rgb_and_depth(self):
+        alpha = torch.tensor(
+            [[[
+                NUMERICAL_EPSILON / 2.0,
+                0.2,
+                0.3,
+                0.4,
+            ], [0.0, 0.0, 0.0, 0.0]]]
+        )
+        baseline_depth = 2.0 * alpha
+        extreme_depth = baseline_depth.clone()
+        extreme_depth[0, 0, 0] = 1000.0
+        baseline_rgb = torch.zeros(3, self.height, self.width)
+        extreme_rgb = baseline_rgb.clone()
+        extreme_rgb[:, 0, 0] = 1000.0
+        _, baseline = self._select(
+            "evidence",
+            getter=SnapshotGetter(torch.full((1, 4), SQRT_2)),
+            evidence=self._evidence(
+                alpha=alpha,
+                depth=baseline_depth,
+                rgb=baseline_rgb,
+            ),
+        )
+        _, extreme = self._select(
+            "evidence",
+            getter=SnapshotGetter(torch.full((1, 4), SQRT_2)),
+            evidence=self._evidence(
+                alpha=alpha,
+                depth=extreme_depth,
+                rgb=extreme_rgb,
+            ),
+        )
+        self.assertTrue(torch.equal(baseline.selected_indices, extreme.selected_indices))
+        self.assertEqual(extreme.token.fields["coverage_valid_count"], 4)
+        self.assertEqual(extreme.token.fields["rgb_l1_valid_count"], 4)
+        self.assertEqual(
+            extreme.token.fields["depth_relative_error_valid_count"], 4
+        )
+
+    def test_alpha_zero_residuals_cannot_change_coverage_only_quality(self):
+        quality, valid, rgb_valid, depth_valid = self._weighted_quality(
+            alpha=[0.0],
+            rgb_l1=[1.0],
+            depth_saturated=[1.0],
+            rgb_valid=[True],
+            depth_valid=[True],
+        )
+        self.assertTrue(valid.item())
+        self.assertTrue(rgb_valid.item())
+        self.assertTrue(depth_valid.item())
+        self.assertEqual(quality.item(), 1.0)
+
+    def test_alpha_weighted_quality_is_continuous_around_numerical_epsilon(self):
+        alpha = torch.tensor(
+            [
+                0.0,
+                NUMERICAL_EPSILON / 2.0,
+                NUMERICAL_EPSILON,
+                NUMERICAL_EPSILON * 2.0,
+                0.5,
+            ],
+            dtype=torch.float32,
+        )
+        quality, valid, _, _ = self._weighted_quality(
+            alpha=alpha,
+            rgb_l1=torch.ones_like(alpha),
+            depth_saturated=torch.zeros_like(alpha),
+            rgb_valid=torch.ones_like(alpha, dtype=torch.bool),
+            depth_valid=torch.zeros_like(alpha, dtype=torch.bool),
+        )
+        expected = torch.reciprocal(1.0 + alpha)
+        torch.testing.assert_close(quality, expected, atol=1.0e-7, rtol=1.0e-7)
+        self.assertTrue(torch.all(valid))
+        self.assertLess(
+            abs(quality[1].item() - quality[2].item()),
+            2.0 * NUMERICAL_EPSILON,
+        )
+        self.assertLess(
+            abs(quality[2].item() - quality[3].item()),
+            2.0 * NUMERICAL_EPSILON,
+        )
+
+    def test_large_alpha_valid_residuals_change_quality(self):
+        quality, _, _, _ = self._weighted_quality(
+            alpha=[0.8, 0.8],
+            rgb_l1=[0.0, 1.0],
+            depth_saturated=[0.0, 1.0],
+            rgb_valid=[True, True],
+            depth_valid=[True, True],
+        )
+        self.assertGreater(quality[1].item(), quality[0].item())
+
+    def test_component_specific_denominators_and_coverage_degradation(self):
+        cases = (
+            (False, True, 0.6),
+            (True, False, (0.5 + 0.5 * 0.6) / 1.5),
+            (False, False, 0.5),
+        )
+        for rgb_is_valid, depth_is_valid, expected in cases:
+            with self.subTest(
+                rgb_valid=rgb_is_valid,
+                depth_valid=depth_is_valid,
+            ):
+                quality, _, _, _ = self._weighted_quality(
+                    alpha=[0.5],
+                    rgb_l1=[0.6],
+                    depth_saturated=[0.8],
+                    rgb_valid=[rgb_is_valid],
+                    depth_valid=[depth_is_valid],
+                )
+                self.assertAlmostEqual(quality.item(), expected, places=6)
+
+    def test_partial_nonfinite_components_are_removed_and_renormalized(self):
+        alpha = torch.full((1, self.height, self.width), 0.5)
+        depth = 2.0 * alpha
+        depth[0, 0, 1] = float("nan")
+        rgb = torch.zeros(3, self.height, self.width)
+        rgb[:, 0, 0] = float("nan")
+        _, result = self._select(
+            "evidence",
+            getter=SnapshotGetter(torch.full((1, 4), SQRT_2)),
+            evidence=self._evidence(alpha=alpha, depth=depth, rgb=rgb),
+        )
+        self.assertEqual(result.selected_indices.tolist(), [0, 1])
+        self.assertEqual(result.token.fields["rgb_l1_valid_count"], 3)
+        self.assertEqual(
+            result.token.fields["depth_relative_error_valid_count"], 3
+        )
+
+    def test_active_fallback_contracts(self):
+        unavailable = self._evidence(available=False, reason="empty_old_map")
+        cases = (
+            (
+                "coverage",
+                self.getter,
+                unavailable,
+                [0, 3],
+                "deterministic_uniform_fallback",
+            ),
+            (
+                "evidence",
+                SnapshotGetter(self.confidence, stale=True),
+                self._evidence(),
+                [0, 1],
+                "coverage_only_fallback",
+            ),
+            (
+                "evidence",
+                self.getter,
+                unavailable,
+                [2, 3],
+                "confidence_topk_fallback",
+            ),
+            (
+                "evidence",
+                SnapshotGetter(
+                    self.confidence,
+                    error=RuntimeError("confidence is not valid"),
+                ),
+                unavailable,
+                [0, 3],
+                "deterministic_uniform_fallback",
+            ),
+        )
+        for strategy, getter, evidence, indices, reason in cases:
+            with self.subTest(reason=reason):
+                _, result = self._select(
+                    strategy,
+                    getter=getter,
+                    evidence=evidence,
+                )
+                self.assertEqual(result.selected_indices.tolist(), indices)
+                self.assertEqual(result.token.fields["reason"], reason)
+                self.assertIsNotNone(result.token.fields["fallback_reason"])
+
+    def test_confidence_fallback_uses_frozen_raw_v1_ranking(self):
+        confidence = torch.tensor(
+            [[2.0 * SQRT_2, 4.0 * SQRT_2, 3.0 * SQRT_2, 0.0]],
+            dtype=torch.float32,
+        )
+        _, result = self._select(
+            "evidence",
+            getter=SnapshotGetter(confidence),
+            evidence=self._evidence(available=False),
+        )
+        # Normalized values 0..2 all clamp to one; raw V1 ranking must retain
+        # indices 1 and 2 rather than turning index 0 into an artificial tie.
+        self.assertEqual(result.selected_indices.tolist(), [1, 2])
+        self.assertEqual(result.token.fields["reason"], "confidence_topk_fallback")
+
+    def test_active_boundaries_ties_and_five_tensor_alignment(self):
+        empty = tuple(value[:0] for value in self.candidates)
+        _, empty_result = self._select(
+            "coverage",
+            candidates=empty,
+            fixed_k=2,
+        )
+        self.assertEqual(empty_result.xyz.shape[0], 0)
+        self.assertIsNone(empty_result.selected_indices)
+        small = tuple(value[:2] for value in self.candidates)
+        _, small_result = self._select(
+            "coverage",
+            candidates=small,
+            fixed_k=2,
+        )
+        self.assertIsNone(small_result.selected_indices)
+        for actual, original in zip(
+            (
+                small_result.xyz,
+                small_result.features,
+                small_result.scales,
+                small_result.rotations,
+                small_result.opacities,
+            ),
+            small,
+        ):
+            self.assertIs(actual, original)
+
+        tied_alpha = torch.full((1, self.height, self.width), 0.5)
+        _, result = self._select(
+            "coverage",
+            evidence=self._evidence(alpha=tied_alpha, depth=2.0 * tied_alpha),
+        )
+        self.assertEqual(result.selected_indices.tolist(), [0, 1])
+        for actual, original in zip(
+            (
+                result.xyz,
+                result.features,
+                result.scales,
+                result.rotations,
+                result.opacities,
+            ),
+            self.candidates,
+        ):
+            torch.testing.assert_close(
+                actual,
+                torch.index_select(original, 0, result.selected_indices),
+                atol=0.0,
+                rtol=0.0,
+            )
+
+    def test_active_candidate_shape_contract_fails_closed(self):
+        malformed = list(self.candidates)
+        malformed[4] = malformed[4].reshape(-1)
+        with self.assertRaisesRegex(ValueError, "shape contract violation"):
+            self._select("coverage", candidates=tuple(malformed))
+
+    def test_active_init_bypass_does_not_read_evidence_or_confidence(self):
+        trap = SnapshotGetter(
+            self.confidence,
+            error=AssertionError("confidence must not be read"),
+        )
+        references = tuple(self.candidates)
+        _, result = self._select(
+            "evidence",
+            getter=trap,
+            evidence=None,
+            init=True,
+        )
+        self.assertEqual(result.token.fields["reason"], "init_bypass")
+        self.assertIsNone(result.selected_indices)
+        self.assertEqual(trap.calls, 0)
+        for actual, reference in zip(
+            (
+                result.xyz,
+                result.features,
+                result.scales,
+                result.rotations,
+                result.opacities,
+            ),
+            references,
+        ):
+            self.assertIs(actual, reference)
+
+    def test_active_reuses_evidence_without_renderer_or_quantile_hot_path(self):
+        source = inspect.getsource(GaussianCandidateActiveFixedKV2)
+        for forbidden in (
+            ".cpu(",
+            ".tolist(",
+            ".numpy(",
+            "torch.quantile",
+            "cuda.synchronize",
+            "gaussian_renderer",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, source)
+
+        class Trap(PreinsertRenderEvidenceObserverV1):
+            def capture(self, **kwargs):
+                raise AssertionError("Active V2 must never render again.")
+
+        selector = build_gaussian_candidate_selector_v2(
+            {
+                "mode": "active_fixed_k",
+                "strategy": "coverage",
+                "fixed_k": 2,
+                "diversity_strength": 0.1,
+                "logging": {"enabled": True},
+            },
+            candidate_selector_v1=None,
+            resource_admission_mode="disabled",
+            preinsert_render_evidence_v1=Trap(device="cpu"),
+            confidence_snapshot_getter=self.getter,
+            device="cpu",
+        )
+        result = selector.select_before_extend(
+            xyz=self.candidates[0],
+            features=self.candidates[1],
+            scales=self.candidates[2],
+            rotations=self.candidates[3],
+            opacities=self.candidates[4],
+            camera=self.camera,
+            depthmap=None,
+            depth_source="estimated_clean_depth",
+            mapper_update_id=23,
+            init=False,
+            gaussian_before=11,
+            preinsert_render_evidence=self._evidence(),
+        )
+        self.assertEqual(result.selected_indices.tolist(), [0, 1])
+
+    def test_active_logging_is_tensor_free_and_aggregate_only(self):
+        selector = GaussianCandidateActiveFixedKV2(
+            confidence_snapshot_getter=self.getter,
+            logging_enabled=True,
+            device="cpu",
+            strategy="coverage",
+            fixed_k=2,
+            diversity_strength=0.1,
+        )
+        result = selector.select_before_extend(
+            xyz=self.candidates[0],
+            features=self.candidates[1],
+            scales=self.candidates[2],
+            rotations=self.candidates[3],
+            opacities=self.candidates[4],
+            camera=self.camera,
+            depthmap=None,
+            depth_source="estimated_clean_depth",
+            mapper_update_id=23,
+            init=False,
+            gaussian_before=11,
+            preinsert_render_evidence=self._evidence(),
+        )
+        self.assertFalse(_contains_tensor(result.token.fields))
+        stream = io.StringIO()
+        with redirect_stdout(stream):
+            summary = selector.record_active_after_extend(
+                result.token,
+                admitted_candidate_count=2,
+                dropped_candidate_count=0,
+                gaussian_after_extend=13,
+                m01_second_selection_applied=False,
+            )
+        event = json.loads(stream.getvalue().strip().split(" ", 1)[1])
+        self.assertEqual(event, summary.to_event())
+        self.assertEqual(event["event_type"], "candidate_active_selection_v2")
+        self.assertEqual(event["strategy"], "coverage")
+        self.assertEqual(event["fixed_k"], 2)
+        self.assertEqual(event["candidate_count"], 4)
+        self.assertEqual(event["selected_count"], 2)
+        self.assertNotIn("candidate_values", event)
+        self.assertNotIn("quantiles", event)
+
+    def test_gaussian_model_active_hook_filters_once_before_extend(self):
+        extend_from_pcd_seq = load_gaussian_model_extend_from_pcd_seq()
+        harness = GaussianModelHookHarness(self.candidates)
+        selector = self._active_selector("coverage")
+        extend_from_pcd_seq(
+            harness,
+            self.camera,
+            self.camera.uid,
+            init=False,
+            candidate_selector_v2=selector,
+            mapper_update_id=23,
+            preinsert_render_evidence=self._evidence(),
+        )
+        self.assertEqual(harness.extend_calls, 1)
+        self.assertEqual(harness.last_extended_count, 2)
+        self.assertEqual(len(harness), 13)
+        self.assertEqual(self.getter.calls, 0)
+
+    def test_gaussian_model_rejects_v1_v2_or_m01_second_selection(self):
+        extend_from_pcd_seq = load_gaussian_model_extend_from_pcd_seq()
+        selector = self._active_selector("coverage")
+        harness = GaussianModelHookHarness(self.candidates)
+        with self.assertRaisesRegex(RuntimeError, "mutually exclusive"):
+            extend_from_pcd_seq(
+                harness,
+                self.camera,
+                self.camera.uid,
+                init=False,
+                candidate_selector_v1=object(),
+                candidate_selector_v2=selector,
+                mapper_update_id=23,
+                preinsert_render_evidence=self._evidence(),
+            )
+        self.assertEqual(harness.extend_calls, 0)
+
+        harness = GaussianModelHookHarness(self.candidates)
+        harness.resource_admission = object()
+        with self.assertRaisesRegex(RuntimeError, "ResourceAdmission"):
+            extend_from_pcd_seq(
+                harness,
+                self.camera,
+                self.camera.uid,
+                init=False,
+                candidate_selector_v2=selector,
+                mapper_update_id=23,
+                preinsert_render_evidence=self._evidence(),
+            )
+        self.assertEqual(harness.extend_calls, 0)
 
 
 if __name__ == "__main__":
