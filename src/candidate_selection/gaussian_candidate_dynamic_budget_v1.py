@@ -1,4 +1,4 @@
-"""Tensor-free histogram calibration for a future GCS-v2 dynamic budget."""
+"""Fixed-size q histograms and bounded GCS-v2 dynamic-budget parameters."""
 
 from __future__ import annotations
 
@@ -14,7 +14,9 @@ import torch
 DEFAULT_OBSERVE_HISTOGRAM_BINS = 32
 DEFAULT_K_MAX_REFERENCE = 600
 HISTOGRAM_RANGE = (0.0, 1.0)
-_CONFIG_FIELDS = frozenset({"observe_histogram_bins", "k_max_reference"})
+_CONFIG_FIELDS = frozenset({
+    "observe_histogram_bins", "k_max_reference", "threshold_bin", "k_min", "k_max",
+})
 
 
 def _positive_int(value: Any, field: str) -> int:
@@ -26,10 +28,21 @@ def _positive_int(value: Any, field: str) -> int:
     return value
 
 
+def bounded_dynamic_target_v1(
+    *, candidate_count: int, demand_count: int, k_min: int, k_max: int
+) -> int:
+    """Apply the frozen bounded-demand contract without touching tensors."""
+
+    return min(candidate_count, max(k_min, min(k_max, demand_count)))
+
+
 @dataclass(frozen=True)
 class DynamicBudgetObserveConfigV1:
     observe_histogram_bins: int = DEFAULT_OBSERVE_HISTOGRAM_BINS
     k_max_reference: int = DEFAULT_K_MAX_REFERENCE
+    threshold_bin: int = 1
+    k_min: int = 256
+    k_max: int = 600
 
 
 def normalize_dynamic_budget_observe_config_v1(
@@ -42,15 +55,28 @@ def normalize_dynamic_budget_observe_config_v1(
     unknown = sorted(set(config) - _CONFIG_FIELDS)
     if unknown:
         raise ValueError(f"{field} contains unknown fields: {unknown}.")
+    observe_histogram_bins = _positive_int(
+        config.get("observe_histogram_bins", DEFAULT_OBSERVE_HISTOGRAM_BINS),
+        f"{field}.observe_histogram_bins")
+    threshold_bin = _positive_int(
+        config.get("threshold_bin", 1), f"{field}.threshold_bin")
+    if threshold_bin >= observe_histogram_bins:
+        raise ValueError(
+            f"{field}.threshold_bin must be less than observe_histogram_bins."
+        )
+    k_min = _positive_int(config.get("k_min", 256), f"{field}.k_min")
+    k_max = _positive_int(config.get("k_max", 600), f"{field}.k_max")
+    if k_min > k_max:
+        raise ValueError(f"{field}.k_min must not exceed k_max.")
     return DynamicBudgetObserveConfigV1(
-        observe_histogram_bins=_positive_int(
-            config.get("observe_histogram_bins", DEFAULT_OBSERVE_HISTOGRAM_BINS),
-            f"{field}.observe_histogram_bins",
-        ),
+        observe_histogram_bins=observe_histogram_bins,
         k_max_reference=_positive_int(
             config.get("k_max_reference", DEFAULT_K_MAX_REFERENCE),
             f"{field}.k_max_reference",
         ),
+        threshold_bin=threshold_bin,
+        k_min=k_min,
+        k_max=k_max,
     )
 
 
@@ -87,6 +113,13 @@ class GaussianCandidateDynamicBudgetObserverV1:
             raise TypeError("config must be DynamicBudgetObserveConfigV1.")
         self.observe_histogram_bins = config.observe_histogram_bins
         self.k_max_reference = config.k_max_reference
+        self.threshold_bin = config.threshold_bin
+        self.k_min = config.k_min
+        self.k_max = config.k_max
+
+    @property
+    def utility_threshold(self) -> float:
+        return self.threshold_bin / self.observe_histogram_bins
 
     def observe(
         self, quality: torch.Tensor, quality_valid: torch.Tensor
@@ -115,11 +148,17 @@ class GaussianCandidateDynamicBudgetObserverV1:
         invalid_count = torch.full(
             (), q.shape[0], dtype=torch.int64, device=q.device
         ) - valid_count
-        histogram = torch.histc(
-            q[valid].to(torch.float32),
-            bins=self.observe_histogram_bins,
-            min=HISTOGRAM_RANGE[0],
-            max=HISTOGRAM_RANGE[1],
+        # Explicit uniform-bin assignment makes every threshold edge exact:
+        # floor(q * B), with q == 1 clamped into the final bin.  In particular,
+        # q == threshold_bin / B enters threshold_bin rather than the lower bin.
+        bin_indices = torch.floor(
+            q[valid] * self.observe_histogram_bins
+        ).to(torch.long)
+        bin_indices = torch.clamp(
+            bin_indices, min=0, max=self.observe_histogram_bins - 1
+        )
+        histogram = torch.bincount(
+            bin_indices, minlength=self.observe_histogram_bins
         ).to(torch.int64)
         # The sole DtoH is fixed-size: valid, invalid, and B histogram counts.
         status = torch.cat((valid_count[None], invalid_count[None], histogram)).cpu()

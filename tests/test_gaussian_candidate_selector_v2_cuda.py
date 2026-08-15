@@ -19,6 +19,7 @@ import torch
 from src.candidate_selection.gaussian_candidate_selector_v2 import (
     NUMERICAL_EPSILON,
     GaussianCandidateActiveFixedKV2,
+    GaussianCandidateActiveDynamicKV2,
     GaussianCandidateDynamicKObserveV2,
     GaussianCandidateSelectorV2,
     build_gaussian_candidate_selector_v2,
@@ -164,6 +165,26 @@ class GaussianCandidateSelectorV2CudaTests(unittest.TestCase):
             dynamic_budget_config=DynamicBudgetObserveConfigV1(
                 observe_histogram_bins=32,
                 k_max_reference=600,
+            ),
+        )
+        return selector, getter
+
+    @staticmethod
+    def _dynamic_active_selector(
+        confidence, *, bins=32, threshold_bin=1, k_min=256, k_max=600,
+        logging_enabled=False,
+    ):
+        getter = _CurrentSnapshotGetter(confidence)
+        selector = GaussianCandidateActiveDynamicKV2(
+            confidence_snapshot_getter=getter,
+            logging_enabled=logging_enabled,
+            device=CUDA_DEVICE,
+            dynamic_budget_config=DynamicBudgetObserveConfigV1(
+                observe_histogram_bins=bins,
+                k_max_reference=600,
+                threshold_bin=threshold_bin,
+                k_min=k_min,
+                k_max=k_max,
             ),
         )
         return selector, getter
@@ -592,8 +613,19 @@ class GaussianCandidateSelectorV2CudaTests(unittest.TestCase):
                                  for value in vars(owner).values()))
 
     def test_dynamic_k_observe_cuda_histogram_matches_cpu_oracle_without_full_q_copy(self):
+        threshold = 1.0 / 32.0
+        delta = 1.0 / 4096.0
         quality = torch.tensor(
-            [0.0, 1.0, 0.5, 0.125, float("nan"), -0.1, 1.1],
+            [
+                0.0,
+                threshold - delta,
+                threshold,
+                threshold + delta,
+                1.0,
+                float("nan"),
+                -0.1,
+                1.1,
+            ],
             dtype=torch.float32,
             device=CUDA_DEVICE,
         )
@@ -605,14 +637,21 @@ class GaussianCandidateSelectorV2CudaTests(unittest.TestCase):
             )
         )
         result = observer.observe(quality, valid)
-        cpu_values = torch.tensor([0.0, 1.0, 0.5, 0.125], dtype=torch.float32)
-        cpu_histogram = torch.histc(cpu_values, bins=32, min=0.0, max=1.0).to(
-            dtype=torch.int64
+        cpu_values = torch.tensor(
+            [0.0, threshold - delta, threshold, threshold + delta, 1.0],
+            dtype=torch.float32,
         )
+        cpu_bins = torch.clamp(
+            torch.floor(cpu_values * 32).to(torch.long),
+            min=0,
+            max=31,
+        )
+        cpu_histogram = torch.bincount(cpu_bins, minlength=32).to(torch.int64)
         expected = tuple(int(cpu_histogram[index]) for index in range(32))
         self.assertEqual(result.q_histogram_counts, expected)
-        self.assertEqual(result.q_valid_count, 4)
+        self.assertEqual(result.q_valid_count, 5)
         self.assertEqual(result.q_invalid_count, 3)
+        self.assertEqual(sum(result.q_histogram_counts[1:]), 3)
         self.assertTrue(result.diagnostic_gpu_to_cpu_sync_expected)
         source = inspect.getsource(GaussianCandidateDynamicBudgetObserverV1.observe)
         self.assertEqual(source.count(".cpu()"), 1)
@@ -1256,6 +1295,158 @@ class GaussianCandidateSelectorV2CudaTests(unittest.TestCase):
         )
         self.assertFalse(summary.fields["conservation_check"])
         self.assertEqual(summary.fields["error"]["type"], "ForwardingContractError")
+
+    def test_active_dynamic_k_cuda_histogram_selects_256_and_600_boundaries(self):
+        cases = (
+            ([0.0] * 100 + [1.0] * 600, 100, 256),
+            ([0.0] * 700, 700, 600),
+        )
+        for alpha, demand, target in cases:
+            with self.subTest(target=target):
+                camera, candidates, evidence, confidence = self._active_scene(
+                    alpha=alpha,
+                    confidence=[SQRT_2] * 700,
+                )
+                selector, _ = self._dynamic_active_selector(confidence)
+                result = self._active_select(selector, candidates, camera, evidence)
+                fields = result.token.fields
+                self.assertEqual(fields["demand_count"], demand)
+                self.assertEqual(fields["target_k"], target)
+                self.assertEqual(fields["selected_count"], target)
+                self.assertEqual(result.selected_indices.device, CUDA_DEVICE)
+                self.assertEqual(result.selected_indices.dtype, torch.long)
+                self.assertTrue(
+                    torch.equal(
+                        result.selected_indices,
+                        torch.arange(target, device=CUDA_DEVICE),
+                    )
+                )
+                self.assertEqual(sum(fields["q_histogram_counts"]), 700)
+
+    def test_active_dynamic_k_cuda_is_deterministic_across_twenty_runs(self):
+        camera, candidates, evidence, confidence = self._active_scene(
+            alpha=[0.5] * 300,
+            confidence=[SQRT_2] * 300,
+        )
+        selector, _ = self._dynamic_active_selector(confidence)
+        reference = None
+        for _ in range(20):
+            result = self._active_select(selector, candidates, camera, evidence)
+            if reference is None:
+                reference = result.selected_indices.detach().clone()
+            else:
+                self.assertTrue(torch.equal(result.selected_indices, reference))
+        self.assertTrue(
+            torch.equal(reference, torch.arange(256, device=CUDA_DEVICE))
+        )
+
+    def test_active_dynamic_k_cuda_preserves_inputs_versions_and_autograd(self):
+        camera, base_candidates, evidence, confidence = self._active_scene(
+            alpha=[0.0] * 300,
+            confidence=[SQRT_2] * 300,
+        )
+        candidates = tuple(
+            value.detach().clone().requires_grad_(True) for value in base_candidates
+        )
+        states = tuple(
+            (value.data_ptr(), value._version, value.detach().clone())
+            for value in candidates
+        )
+        selector, _ = self._dynamic_active_selector(confidence)
+        result = self._active_select(selector, candidates, camera, evidence)
+        outputs = (
+            result.xyz, result.features, result.scales,
+            result.rotations, result.opacities,
+        )
+        for source, output, state in zip(candidates, outputs, states):
+            pointer, version, frozen = state
+            self.assertEqual(source.data_ptr(), pointer)
+            self.assertEqual(source._version, version)
+            torch.testing.assert_close(source, frozen, atol=0.0, rtol=0.0)
+            self.assertEqual(output.device, CUDA_DEVICE)
+            self.assertTrue(output.requires_grad)
+            self.assertIsNotNone(output.grad_fn)
+
+    def test_active_dynamic_k_cuda_real_mapper_hook_selects_once_and_renders_once(self):
+        camera, model, observer, mapper, events = self.mapper._scene()
+        confidence = torch.tensor([[SQRT_2]], device=CUDA_DEVICE)
+        selector = build_gaussian_candidate_selector_v2(
+            {
+                "mode": "active_dynamic_k",
+                "strategy": "evidence",
+                "dynamic_budget": {
+                    "observe_histogram_bins": 4,
+                    "k_max_reference": 600,
+                    "threshold_bin": 1,
+                    "k_min": 2,
+                    "k_max": 3,
+                },
+                "logging": {"enabled": True},
+            },
+            candidate_selector_v1=None,
+            resource_admission_mode="disabled",
+            preinsert_render_evidence_v1=observer,
+            confidence_snapshot_getter=_CurrentSnapshotGetter(confidence),
+            device=CUDA_DEVICE,
+        )
+        mapper.candidate_selector_v2 = selector
+        select_calls = render_calls = 0
+        summaries = []
+        original_select = selector.select_before_extend
+        original_record = selector.record_active_after_extend
+
+        def select_spy(**kwargs):
+            nonlocal select_calls
+            select_calls += 1
+            events.append("v2_dynamic_select")
+            return original_select(**kwargs)
+
+        def record_spy(token, **kwargs):
+            summary = original_record(token, **kwargs)
+            summaries.append(summary)
+            events.append("v2_dynamic_record")
+            return summary
+
+        def renderer_spy(*args, **kwargs):
+            nonlocal render_calls
+            render_calls += 1
+            events.append("render")
+            return self.mapper.production_render(*args, **kwargs)
+
+        selector.select_before_extend = select_spy
+        selector.record_active_after_extend = record_spy
+        before = len(model)
+        with mock.patch.object(
+            self.mapper.mapper_module, "render", side_effect=renderer_spy
+        ):
+            mapper.add_new_gaussians([camera])
+        self.assertEqual(render_calls, 1)
+        self.assertEqual(select_calls, 1)
+        self.assertEqual(len(summaries), 1)
+        self.assertTrue(summaries[0].fields["conservation_check"])
+        self.assertEqual(
+            len(model), before + summaries[0].fields["selected_count"]
+        )
+        self.assertLess(events.index("render"), events.index("candidate_generation"))
+        self.assertLess(
+            events.index("candidate_generation"), events.index("v2_dynamic_select")
+        )
+        self.assertLess(events.index("v2_dynamic_select"), events.index("extend"))
+
+    def test_active_dynamic_k_cuda_source_has_no_extra_render_or_full_q_copy(self):
+        source = inspect.getsource(GaussianCandidateActiveDynamicKV2)
+        for forbidden in (
+            "quality.cpu", ".tolist(", ".numpy(", "torch.quantile",
+            "cuda.synchronize", "gaussian_renderer", "render(",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, source)
+        self.assertEqual(
+            inspect.getsource(GaussianCandidateDynamicBudgetObserverV1.observe).count(
+                ".cpu()"
+            ),
+            1,
+        )
 
 
 if __name__ == "__main__":

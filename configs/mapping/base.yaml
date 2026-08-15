@@ -100,11 +100,15 @@ candidate_selector_v2:
   # confidence-cell diminishing returns. It is not frozen, global-map
   # redundancy, or a theoretically optimal value.
   diversity_strength: 0.1
-  # Observe-only calibration metadata. These are diagnostic protocol fields,
-  # not frozen dynamic-budget algorithm parameters.
+  # Shared calibration histogram plus first bounded Dynamic-K experiment.
+  # The active threshold/bounds are experimental, not theoretical optima.
   dynamic_budget:
     observe_histogram_bins: 32
     k_max_reference: 600
+    # First bounded marginal-utility experiment parameters; not theoretical optima.
+    threshold_bin: 1
+    k_min: 256
+    k_max: 600
   logging:
     enabled: true
 

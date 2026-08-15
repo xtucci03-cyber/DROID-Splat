@@ -1,4 +1,4 @@
-"""Marginal-utility diagnostics and fixed-budget experiments for GCS-v2.
+"""Marginal-utility diagnostics and bounded-budget experiments for GCS-v2.
 
 This module consumes the already-captured pre-insertion render evidence.  It
 never renders.  The original V2-A observer remains pass-through; the separate
@@ -20,6 +20,7 @@ import torch
 from .gaussian_candidate_dynamic_budget_v1 import (
     DynamicBudgetObserveConfigV1,
     GaussianCandidateDynamicBudgetObserverV1,
+    bounded_dynamic_target_v1,
     normalize_dynamic_budget_observe_config_v1,
 )
 from .gaussian_candidate_active_topk_v1 import (
@@ -42,8 +43,9 @@ SCHEMA_VERSION = 1
 MODE = "observe"
 ACTIVE_FIXED_K_MODE = "active_fixed_k"
 DYNAMIC_K_OBSERVE_MODE = "dynamic_k_observe"
+ACTIVE_DYNAMIC_K_MODE = "active_dynamic_k"
 SUPPORTED_MODES = frozenset(
-    {"off", MODE, ACTIVE_FIXED_K_MODE, DYNAMIC_K_OBSERVE_MODE}
+    {"off", MODE, ACTIVE_FIXED_K_MODE, DYNAMIC_K_OBSERVE_MODE, ACTIVE_DYNAMIC_K_MODE}
 )
 ACTIVE_STRATEGIES = frozenset(
     {"coverage", "evidence", "evidence_projected_cell"}
@@ -225,6 +227,17 @@ def build_gaussian_candidate_selector_v2(
                 "in dynamic_k_observe mode."
             )
         return GaussianCandidateDynamicKObserveV2(
+            **common,
+            dynamic_budget_config=dynamic_budget_config,
+        )
+    if mode == ACTIVE_DYNAMIC_K_MODE:
+        strategy = _normalize_strategy(config.get("strategy", "evidence"))
+        if strategy != "evidence":
+            raise ValueError(
+                "mapping.candidate_selector_v2.strategy must be 'evidence' "
+                "in active_dynamic_k mode."
+            )
+        return GaussianCandidateActiveDynamicKV2(
             **common,
             dynamic_budget_config=dynamic_budget_config,
         )
@@ -1885,8 +1898,22 @@ class GaussianCandidateDynamicKObserveV2(GaussianCandidateSelectorV2):
                 ),
                 "diagnostic_gpu_to_cpu_sync_expected": False,
                 "controller_wall_time_ms": 0.0,
+                "component_diagnostics_collected": False,
+                "component_diagnostics_reason": (
+                    "not_collected_to_preserve_34_element_state"
+                ),
             }
         )
+        fields["projection_valid_count"] = None
+        fields["projection_invalid_count"] = None
+        fields["mask_valid_count"] = None
+        for component in _COMPONENTS:
+            fields[f"{component}_valid_count"] = None
+            fields[f"{component}_invalid_count"] = None
+            fields[component] = None
+        fields["confidence_raw"] = None
+        fields["confidence_norm"] = None
+        fields["candidate_camera_z"] = None
         return fields
 
     def observe_before_extend(
@@ -2067,3 +2094,243 @@ class GaussianCandidateDynamicKObserveV2(GaussianCandidateSelectorV2):
             print(f"{LOG_PREFIX} {payload}", flush=True)
         except Exception:
             return
+
+
+class GaussianCandidateActiveDynamicKV2(GaussianCandidateDynamicKObserveV2):
+    """Bound frozen evidence-q with first-experiment, non-optimal parameters."""
+
+    mode = ACTIVE_DYNAMIC_K_MODE
+    is_active = True
+    _stable_topk = staticmethod(GaussianCandidateActiveFixedKV2._stable_topk)
+    _index_candidates = staticmethod(GaussianCandidateActiveFixedKV2._index_candidates)
+    observe_active_empty = GaussianCandidateActiveFixedKV2.observe_active_empty
+
+    def _active_base_fields(
+        self, *, camera: Any, mapper_update_id: int, candidate_count: int,
+        gaussian_before: int, init: bool,
+    ) -> dict[str, Any]:
+        fields = self._dynamic_base_fields(
+            camera=camera, mapper_update_id=mapper_update_id,
+            candidate_count=candidate_count, gaussian_before=gaussian_before,
+            init=init,
+        )
+        sequence = fields["event_sequence"]
+        fields.update(
+            event_type="candidate_active_dynamic_k_v2",
+            event_id=(
+                f"gcs-v2-active-dynamic:{sequence}:{mapper_update_id}:"
+                f"{fields['source_camera_id']}"
+            ),
+            mode=ACTIVE_DYNAMIC_K_MODE,
+            selection_applied=False,
+            active_selection_applied=False,
+            selected_indices_created=False,
+            threshold_bin=self.dynamic_budget_observer.threshold_bin,
+            utility_threshold=self.dynamic_budget_observer.utility_threshold,
+            k_min=self.dynamic_budget_observer.k_min,
+            k_max=self.dynamic_budget_observer.k_max,
+            demand_count=None,
+            target_k=candidate_count,
+            selected_count=candidate_count,
+            admitted_count=None,
+            dropped_count=None,
+            conservation_check=None,
+            selector_wall_time_ms=0.0,
+        )
+        return fields
+
+    def _fallback_indices(
+        self,
+        *,
+        tensors: Mapping[str, torch.Tensor],
+        render_components: Optional[Mapping[str, torch.Tensor]],
+        confidence_components: Optional[Mapping[str, torch.Tensor]],
+    ) -> tuple[Optional[torch.Tensor], dict[str, torch.Tensor], str]:
+        candidate_count = int(tensors["xyz"].shape[0])
+        budget = min(candidate_count, self.dynamic_budget_observer.k_max)
+        if budget == candidate_count:
+            return None, dict(tensors), "fallback_keep_all_n_le_k_max"
+
+        dtype = tensors["xyz"].dtype
+        device = tensors["xyz"].device
+        negative_infinity = torch.full(
+            (candidate_count,), -torch.inf, dtype=dtype, device=device
+        )
+        if render_components is not None and bool(
+            torch.any(render_components["coverage_valid"]).detach().item()
+        ):
+            scores = torch.where(
+                render_components["coverage_valid"],
+                render_components["coverage"],
+                negative_infinity,
+            )
+            indices = self._stable_topk(scores, budget)
+            reason = "coverage_only_fallback"
+        elif confidence_components is not None and bool(
+            torch.any(confidence_components["valid"]).detach().item()
+        ):
+            scores = torch.where(
+                confidence_components["valid"],
+                confidence_components["raw"],
+                negative_infinity,
+            )
+            indices = self._stable_topk(scores, budget)
+            reason = "confidence_topk_fallback"
+        else:
+            indices = deterministic_uniform_indices(
+                candidate_count=candidate_count,
+                fixed_budget=budget,
+                device=device,
+            )
+            reason = "deterministic_uniform_fallback"
+        return indices, self._index_candidates(tensors, indices), reason
+
+    def select_before_extend(
+        self,
+        *,
+        xyz: torch.Tensor,
+        features: torch.Tensor,
+        scales: torch.Tensor,
+        rotations: torch.Tensor,
+        opacities: torch.Tensor,
+        camera: Any,
+        depthmap: Any,
+        depth_source: str,
+        mapper_update_id: int,
+        init: bool,
+        gaussian_before: int,
+        preinsert_render_evidence: Optional[PreinsertRenderEvidenceV1],
+    ) -> CandidateActiveSelectionResultV2:
+        started_ns = time.perf_counter_ns()
+        candidate_count, tensors = GaussianCandidateActiveFixedKV2._validate_active_candidates(
+            xyz=xyz, features=features, scales=scales, rotations=rotations,
+            opacities=opacities,
+        )
+        input_state = self._tensor_state(tensors)
+        fields = self._active_base_fields(
+            camera=camera, mapper_update_id=mapper_update_id,
+            candidate_count=candidate_count, gaussian_before=gaussian_before,
+            init=init,
+        )
+        selected_indices: Optional[torch.Tensor] = None
+        output = tensors
+
+        if init:
+            fields.update(reason="init_bypass", fallback_reason="init_bypass")
+        elif candidate_count == 0:
+            fields.update(reason="empty_candidate", fallback_reason="empty_candidate")
+        elif candidate_count <= self.dynamic_budget_observer.k_min:
+            fields["reason"] = "keep_all_n_le_k_min"
+        else:
+            projection = GaussianCandidateActiveFixedKV2._active_project(xyz, camera)
+            render_components, evidence_reason = (
+                GaussianCandidateActiveFixedKV2._active_render_components(
+                    self, xyz=xyz, camera=camera,
+                    gaussian_before=gaussian_before,
+                    mapper_update_id=mapper_update_id,
+                    evidence=preinsert_render_evidence, projection=projection,
+                )
+            )
+            confidence_components = None
+            confidence_reason = "current"
+            try:
+                confidence_components = (
+                    GaussianCandidateActiveFixedKV2._active_confidence_components(
+                        self, xyz=xyz, camera=camera, depthmap=depthmap,
+                        depth_source=depth_source, projection=projection,
+                    )
+                )
+            except ActiveConfidenceEvidenceError as error:
+                confidence_reason = error.reason
+
+            histogram = None
+            quality = quality_valid = None
+            if render_components is not None and confidence_components is not None:
+                quality, score_valid, _, _ = (
+                    GaussianCandidateActiveFixedKV2._weighted_evidence_quality(
+                        render_components,
+                        confidence_components,
+                    )
+                )
+                quality_valid = score_valid & torch.any(confidence_components["valid"])
+                histogram = self.dynamic_budget_observer.observe(quality, quality_valid)
+                fields.update(histogram.to_fields())
+
+            if (
+                histogram is not None
+                and histogram.q_valid_count >= self.dynamic_budget_observer.k_min
+            ):
+                demand_count = sum(
+                    histogram.q_histogram_counts[self.dynamic_budget_observer.threshold_bin :]
+                )
+                target_k = bounded_dynamic_target_v1(
+                    candidate_count=candidate_count,
+                    demand_count=demand_count,
+                    k_min=self.dynamic_budget_observer.k_min,
+                    k_max=self.dynamic_budget_observer.k_max,
+                )
+                fields.update(
+                    demand_count=demand_count,
+                    target_k=target_k,
+                    reason="evidence_dynamic_k",
+                )
+                if target_k < candidate_count:
+                    scores = torch.where(
+                        quality_valid,
+                        quality,
+                        torch.full_like(quality, -torch.inf),
+                    )
+                    selected_indices = self._stable_topk(scores, target_k)
+                    output = self._index_candidates(tensors, selected_indices)
+                    fields.update(
+                        selection_applied=True,
+                        active_selection_applied=True,
+                        selected_indices_created=True,
+                    )
+            else:
+                if histogram is not None:
+                    fallback_reason = "insufficient_valid_evidence_quality"
+                elif render_components is None:
+                    fallback_reason = evidence_reason
+                else:
+                    fallback_reason = confidence_reason
+                selected_indices, output, fallback_mode = self._fallback_indices(
+                    tensors=tensors,
+                    render_components=render_components,
+                    confidence_components=confidence_components,
+                )
+                fields.update(reason=fallback_mode, fallback_reason=fallback_reason)
+                if selected_indices is not None:
+                    fields.update(
+                        target_k=int(selected_indices.shape[0]),
+                        selection_applied=True,
+                        active_selection_applied=True,
+                        selected_indices_created=True,
+                    )
+
+        if self._tensor_state(tensors) != input_state:
+            raise RuntimeError("GCS-v2 dynamic selector mutated candidate inputs.")
+        selected_count = int(output["xyz"].shape[0])
+        if any(int(value.shape[0]) != selected_count for value in output.values()):
+            raise RuntimeError("GCS-v2 dynamic candidate fields are misaligned.")
+        fields["selected_count"] = selected_count
+        elapsed_ms = (time.perf_counter_ns() - started_ns) / 1_000_000.0
+        fields["selector_wall_time_ms"] = (
+            elapsed_ms if math.isfinite(elapsed_ms) else None
+        )
+        return CandidateActiveSelectionResultV2(
+            xyz=output["xyz"], features=output["features"],
+            scales=output["scales"], rotations=output["rotations"],
+            opacities=output["opacities"], selected_indices=selected_indices,
+            token=CandidateActiveSelectionTokenV2(fields=fields),
+        )
+
+    def record_active_after_extend(self, token, **kwargs):
+        fields = dict(token.fields)
+        fields["admitted_count"] = int(kwargs["admitted_candidate_count"])
+        fields["dropped_count"] = int(fields["candidate_count"]) - fields["admitted_count"]
+        return GaussianCandidateActiveFixedKV2.record_active_after_extend(
+            self, CandidateActiveSelectionTokenV2(fields=fields), **kwargs
+        )
+
+    _emit_active = staticmethod(GaussianCandidateActiveFixedKV2._emit_active)
