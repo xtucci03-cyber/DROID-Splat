@@ -17,6 +17,11 @@ from typing import Any, Callable, Mapping, Optional
 
 import torch
 
+from .gaussian_candidate_dynamic_budget_v1 import (
+    DynamicBudgetObserveConfigV1,
+    GaussianCandidateDynamicBudgetObserverV1,
+    normalize_dynamic_budget_observe_config_v1,
+)
 from .gaussian_candidate_active_topk_v1 import (
     ActiveConfidenceEvidenceError,
     CONFIDENCE_SAMPLING_METHOD,
@@ -36,7 +41,10 @@ LOG_PREFIX = "[GaussianCandidateSelectorV2]"
 SCHEMA_VERSION = 1
 MODE = "observe"
 ACTIVE_FIXED_K_MODE = "active_fixed_k"
-SUPPORTED_MODES = frozenset({"off", MODE, ACTIVE_FIXED_K_MODE})
+DYNAMIC_K_OBSERVE_MODE = "dynamic_k_observe"
+SUPPORTED_MODES = frozenset(
+    {"off", MODE, ACTIVE_FIXED_K_MODE, DYNAMIC_K_OBSERVE_MODE}
+)
 ACTIVE_STRATEGIES = frozenset(
     {"coverage", "evidence", "evidence_projected_cell"}
 )
@@ -46,7 +54,14 @@ NUMERICAL_EPSILON = 1.0e-6
 CONFIDENCE_NORMALIZER = math.sqrt(2.0)
 
 _TOP_LEVEL_FIELDS = frozenset(
-    {"mode", "strategy", "fixed_k", "diversity_strength", "logging"}
+    {
+        "mode",
+        "strategy",
+        "fixed_k",
+        "diversity_strength",
+        "dynamic_budget",
+        "logging",
+    }
 )
 _LOGGING_FIELDS = frozenset({"enabled"})
 _COMPONENTS = (
@@ -167,6 +182,9 @@ def build_gaussian_candidate_selector_v2(
         logging.get("enabled", True),
         "mapping.candidate_selector_v2.logging.enabled",
     )
+    dynamic_budget_config = normalize_dynamic_budget_observe_config_v1(
+        config.get("dynamic_budget", None)
+    )
     if mode == "off":
         return None
     if not logging_enabled:
@@ -199,6 +217,17 @@ def build_gaussian_candidate_selector_v2(
     }
     if mode == MODE:
         return GaussianCandidateSelectorV2(**common)
+    if mode == DYNAMIC_K_OBSERVE_MODE:
+        strategy = _normalize_strategy(config.get("strategy", "evidence"))
+        if strategy != "evidence":
+            raise ValueError(
+                "mapping.candidate_selector_v2.strategy must be 'evidence' "
+                "in dynamic_k_observe mode."
+            )
+        return GaussianCandidateDynamicKObserveV2(
+            **common,
+            dynamic_budget_config=dynamic_budget_config,
+        )
     return GaussianCandidateActiveFixedKV2(
         **common,
         strategy=_normalize_strategy(config.get("strategy", "evidence")),
@@ -1782,3 +1811,255 @@ class GaussianCandidateActiveFixedKV2(GaussianCandidateSelectorV2):
                 allow_nan=False,
             )
         print(f"{LOG_PREFIX} {payload}", flush=True)
+
+
+class GaussianCandidateDynamicKObserveV2(GaussianCandidateSelectorV2):
+    """Observe frozen evidence-q histograms without selecting candidates."""
+
+    mode = DYNAMIC_K_OBSERVE_MODE
+    is_active = False
+
+    def __init__(
+        self,
+        *,
+        confidence_snapshot_getter: Callable[..., Any],
+        logging_enabled: bool,
+        device: Any,
+        dynamic_budget_config: DynamicBudgetObserveConfigV1,
+    ) -> None:
+        super().__init__(
+            confidence_snapshot_getter=confidence_snapshot_getter,
+            logging_enabled=logging_enabled,
+            device=device,
+        )
+        self.strategy = "evidence"
+        self.dynamic_budget_observer = GaussianCandidateDynamicBudgetObserverV1(
+            dynamic_budget_config
+        )
+
+    def _dynamic_base_fields(
+        self,
+        *,
+        camera: Any,
+        mapper_update_id: int,
+        candidate_count: int,
+        gaussian_before: int,
+        init: bool,
+    ) -> dict[str, Any]:
+        sequence = self._next_event_sequence()
+        fields = self._base_fields(
+            sequence=sequence,
+            camera=camera,
+            mapper_update_id=mapper_update_id,
+            candidate_count=candidate_count,
+            gaussian_before=gaussian_before,
+            init=init,
+        )
+        fields.update(
+            {
+                "event_type": "candidate_dynamic_budget_observe_v1",
+                "event_id": (
+                    f"gcs-v2-dynamic-observe:{sequence}:{mapper_update_id}:"
+                    f"{fields['source_camera_id']}"
+                ),
+                "mode": DYNAMIC_K_OBSERVE_MODE,
+                "strategy": "evidence",
+                "selection_applied": False,
+                "fallback_reason": None,
+                "q_valid_count": 0,
+                "q_invalid_count": int(candidate_count),
+                "q_histogram_bins": (
+                    self.dynamic_budget_observer.observe_histogram_bins
+                ),
+                "q_histogram_counts": [
+                    0
+                ] * self.dynamic_budget_observer.observe_histogram_bins,
+                "q_histogram_range": [0.0, 1.0],
+                "count_above_bin_edges_recoverable": True,
+                "k_max_reference": (
+                    self.dynamic_budget_observer.k_max_reference
+                ),
+                "diagnostic_gpu_to_cpu_sync_expected": False,
+                "controller_wall_time_ms": 0.0,
+            }
+        )
+        return fields
+
+    def observe_before_extend(
+        self,
+        *,
+        xyz: torch.Tensor,
+        features: torch.Tensor,
+        scales: torch.Tensor,
+        rotations: torch.Tensor,
+        opacities: torch.Tensor,
+        camera: Any,
+        depthmap: Any,
+        depth_source: str,
+        mapper_update_id: int,
+        init: bool,
+        gaussian_before: int,
+        preinsert_render_evidence: Optional[PreinsertRenderEvidenceV1],
+    ) -> CandidateMarginalUtilityTokenV2:
+        started_ns = time.perf_counter_ns()
+        candidate_count, tensors = (
+            GaussianCandidateActiveFixedKV2._validate_active_candidates(
+                xyz=xyz,
+                features=features,
+                scales=scales,
+                rotations=rotations,
+                opacities=opacities,
+            )
+        )
+        input_state = self._tensor_state(tensors)
+        fields = self._dynamic_base_fields(
+            camera=camera,
+            mapper_update_id=mapper_update_id,
+            candidate_count=candidate_count,
+            gaussian_before=gaussian_before,
+            init=init,
+        )
+
+        if init:
+            fields.update(
+                reason="init_bypass",
+                fallback_reason="init_bypass",
+                evidence_reason="init_bypass",
+                confidence_reason="init_bypass",
+            )
+        elif candidate_count == 0:
+            fields.update(
+                reason="empty_candidate",
+                fallback_reason="empty_candidate",
+                evidence_reason="empty_candidate",
+                confidence_reason="empty_candidate",
+            )
+        else:
+            try:
+                projection = GaussianCandidateActiveFixedKV2._active_project(
+                    xyz, camera
+                )
+                render_components, evidence_reason = (
+                    GaussianCandidateActiveFixedKV2._active_render_components(
+                        self,
+                        xyz=xyz,
+                        camera=camera,
+                        gaussian_before=gaussian_before,
+                        mapper_update_id=mapper_update_id,
+                        evidence=preinsert_render_evidence,
+                        projection=projection,
+                    )
+                )
+            except Exception as error:
+                fields.update(
+                    reason="dynamic_q_unavailable",
+                    fallback_reason="invalid_candidate_projection",
+                    evidence_reason="invalid_candidate_projection",
+                    evidence_error=_structured_error(error),
+                )
+                render_components = None
+                evidence_reason = "invalid_candidate_projection"
+
+            fields["evidence_reason"] = evidence_reason
+            if render_components is None:
+                fields.update(
+                    reason="dynamic_q_unavailable",
+                    fallback_reason=evidence_reason,
+                    confidence_reason="not_read_without_evidence",
+                )
+            else:
+                fields["evidence_available"] = True
+                try:
+                    confidence_components = (
+                        GaussianCandidateActiveFixedKV2._active_confidence_components(
+                            self,
+                            xyz=xyz,
+                            camera=camera,
+                            depthmap=depthmap,
+                            depth_source=depth_source,
+                            projection=projection,
+                        )
+                    )
+                except ActiveConfidenceEvidenceError as error:
+                    fields.update(
+                        reason="dynamic_q_unavailable",
+                        fallback_reason=error.reason,
+                        confidence_reason=error.reason,
+                        confidence_error=_structured_error(error),
+                    )
+                else:
+                    fields.update(
+                        evidence_reason="available",
+                        confidence_available=True,
+                        confidence_reason="current",
+                    )
+                    quality, quality_valid, _, _ = (
+                        GaussianCandidateActiveFixedKV2._weighted_evidence_quality(
+                            render_components,
+                            confidence_components,
+                        )
+                    )
+                    quality_valid = quality_valid & torch.any(
+                        confidence_components["valid"]
+                    )
+                    histogram = self.dynamic_budget_observer.observe(
+                        quality,
+                        quality_valid,
+                    )
+                    fields.update(histogram.to_fields())
+                    if histogram.q_valid_count == 0:
+                        fields.update(
+                            reason="dynamic_q_unavailable",
+                            fallback_reason="no_valid_evidence_quality",
+                        )
+                    else:
+                        fields["reason"] = "dynamic_q_histogram_observed"
+
+        if self._tensor_state(tensors) != input_state:
+            raise RuntimeError("GCS-v2 dynamic observe mutated candidate inputs.")
+        elapsed_ms = (time.perf_counter_ns() - started_ns) / 1_000_000.0
+        fields["host_wall_elapsed_ms"] = (
+            elapsed_ms if math.isfinite(elapsed_ms) else None
+        )
+        return CandidateMarginalUtilityTokenV2(fields=fields)
+
+    def observe_empty(
+        self,
+        *,
+        camera: Any,
+        mapper_update_id: int,
+        init: bool,
+        gaussian_before: int,
+        preinsert_render_evidence: Optional[PreinsertRenderEvidenceV1],
+    ) -> CandidateMarginalUtilityTokenV2:
+        del preinsert_render_evidence
+        fields = self._dynamic_base_fields(
+            camera=camera,
+            mapper_update_id=mapper_update_id,
+            candidate_count=0,
+            gaussian_before=gaussian_before,
+            init=init,
+        )
+        reason = "init_bypass" if init else "empty_candidate"
+        fields.update(
+            reason=reason,
+            fallback_reason=reason,
+            evidence_reason=reason,
+            confidence_reason=reason,
+        )
+        return CandidateMarginalUtilityTokenV2(fields=fields)
+
+    @staticmethod
+    def _emit(event: dict[str, Any]) -> None:
+        """Best-effort diagnostic logging must never interrupt admission."""
+
+        try:
+            payload = json.dumps(
+                event,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            print(f"{LOG_PREFIX} {payload}", flush=True)
+        except Exception:
+            return

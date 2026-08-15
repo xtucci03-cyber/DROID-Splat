@@ -13,6 +13,14 @@ from .gaussian_candidate_active_topk_v1 import (
     GaussianCandidateActiveTopKV1,
     stable_quality_topk_indices,
 )
+from .gaussian_candidate_dynamic_budget_v1 import (
+    DEFAULT_K_MAX_REFERENCE,
+    DEFAULT_OBSERVE_HISTOGRAM_BINS,
+    DynamicBudgetObserveConfigV1,
+    DynamicBudgetObserveResultV1,
+    GaussianCandidateDynamicBudgetObserverV1,
+    normalize_dynamic_budget_observe_config_v1,
+)
 from .gaussian_candidate_selector_v1 import (
     CandidateQualityEvidenceSummary,
     CandidateQualityEvidenceToken,
@@ -26,6 +34,7 @@ from .gaussian_candidate_selector_v2 import (
     CandidateMarginalUtilitySummaryV2,
     CandidateMarginalUtilityTokenV2,
     GaussianCandidateActiveFixedKV2,
+    GaussianCandidateDynamicKObserveV2,
     GaussianCandidateSelectorV2,
     build_gaussian_candidate_selector_v2,
 )
@@ -45,6 +54,12 @@ __all__ = [
     "CandidateActiveSelectionSummary",
     "CandidateActiveSelectionToken",
     "GaussianCandidateActiveTopKV1",
+    "DEFAULT_K_MAX_REFERENCE",
+    "DEFAULT_OBSERVE_HISTOGRAM_BINS",
+    "DynamicBudgetObserveConfigV1",
+    "DynamicBudgetObserveResultV1",
+    "GaussianCandidateDynamicBudgetObserverV1",
+    "normalize_dynamic_budget_observe_config_v1",
     "CandidateQualityEvidenceSummary",
     "CandidateQualityEvidenceToken",
     "GaussianCandidateSelectorV1",
@@ -55,6 +70,7 @@ __all__ = [
     "CandidateMarginalUtilitySummaryV2",
     "CandidateMarginalUtilityTokenV2",
     "GaussianCandidateActiveFixedKV2",
+    "GaussianCandidateDynamicKObserveV2",
     "GaussianCandidateSelectorV2",
     "build_gaussian_candidate_selector_v2",
     "stable_quality_topk_indices",

@@ -13,11 +13,17 @@ from unittest import mock
 import torch
 
 from src.candidate_selection.gaussian_candidate_selector_v2 import (
+    DYNAMIC_K_OBSERVE_MODE,
     LOG_PREFIX,
     NUMERICAL_EPSILON,
     GaussianCandidateActiveFixedKV2,
+    GaussianCandidateDynamicKObserveV2,
     GaussianCandidateSelectorV2,
     build_gaussian_candidate_selector_v2,
+)
+from src.candidate_selection.gaussian_candidate_dynamic_budget_v1 import (
+    DynamicBudgetObserveConfigV1,
+    GaussianCandidateDynamicBudgetObserverV1,
 )
 from src.candidate_selection.gaussian_candidate_active_topk_v1 import (
     GaussianCandidateActiveTopKV1,
@@ -222,6 +228,45 @@ class GaussianCandidateSelectorV2Tests(unittest.TestCase):
             fixed_k=fixed_k,
             diversity_strength=0.1,
         )
+
+    def _dynamic_selector(self, *, getter=None, bins=32, k_max_reference=600):
+        return GaussianCandidateDynamicKObserveV2(
+            confidence_snapshot_getter=self.getter if getter is None else getter,
+            logging_enabled=False,
+            device="cpu",
+            dynamic_budget_config=DynamicBudgetObserveConfigV1(
+                observe_histogram_bins=bins,
+                k_max_reference=k_max_reference,
+            ),
+        )
+
+    def _dynamic_observe(
+        self,
+        *,
+        evidence=None,
+        candidates=None,
+        init=False,
+        getter=None,
+    ):
+        candidates = self.candidates if candidates is None else candidates
+        selector = self._dynamic_selector(getter=getter)
+        token = selector.observe_before_extend(
+            xyz=candidates[0],
+            features=candidates[1],
+            scales=candidates[2],
+            rotations=candidates[3],
+            opacities=candidates[4],
+            camera=self.camera,
+            depthmap=None,
+            depth_source="estimated_clean_depth",
+            mapper_update_id=23,
+            init=init,
+            gaussian_before=11,
+            preinsert_render_evidence=(
+                self._evidence() if evidence is None else evidence
+            ),
+        )
+        return selector, token
 
     def _select(
         self,
@@ -460,6 +505,207 @@ class GaussianCandidateSelectorV2Tests(unittest.TestCase):
         self.assertIn('mode: "off"', block)
         self.assertIn('fixed_k: 600', block)
         self.assertIn('diversity_strength: 0.1', block)
+        self.assertIn('observe_histogram_bins: 32', block)
+        self.assertIn('k_max_reference: 600', block)
+
+    def test_dynamic_k_observe_factory_and_config_fail_closed(self):
+        kwargs = dict(
+            candidate_selector_v1=None,
+            resource_admission_mode="disabled",
+            preinsert_render_evidence_v1=SimpleNamespace(mode="observe"),
+            confidence_snapshot_getter=self.getter,
+            device="cpu",
+        )
+        selector = build_gaussian_candidate_selector_v2(
+            {
+                "mode": "dynamic_k_observe",
+                "strategy": "evidence",
+                "dynamic_budget": {
+                    "observe_histogram_bins": 32,
+                    "k_max_reference": 600,
+                },
+                "logging": {"enabled": True},
+            },
+            **kwargs,
+        )
+        self.assertIsInstance(selector, GaussianCandidateDynamicKObserveV2)
+        self.assertEqual(selector.mode, DYNAMIC_K_OBSERVE_MODE)
+        self.assertFalse(selector.is_active)
+
+        for strategy in ("coverage", "evidence_projected_cell"):
+            with self.subTest(strategy=strategy), self.assertRaisesRegex(
+                ValueError, "must be 'evidence'"
+            ):
+                build_gaussian_candidate_selector_v2(
+                    {
+                        "mode": "dynamic_k_observe",
+                        "strategy": strategy,
+                    },
+                    **kwargs,
+                )
+        invalid_configs = (
+            ({"surprise": 1}, "unknown fields"),
+            ({"observe_histogram_bins": 0}, "greater than zero"),
+            ({"observe_histogram_bins": True}, "positive integer"),
+            ({"k_max_reference": 0}, "greater than zero"),
+            ({"k_max_reference": 1.5}, "positive integer"),
+        )
+        for dynamic_budget, message in invalid_configs:
+            with self.subTest(dynamic_budget=dynamic_budget), self.assertRaisesRegex(
+                (TypeError, ValueError), message
+            ):
+                build_gaussian_candidate_selector_v2(
+                    {
+                        "mode": "dynamic_k_observe",
+                        "strategy": "evidence",
+                        "dynamic_budget": dynamic_budget,
+                    },
+                    **kwargs,
+                )
+
+    def test_dynamic_histogram_boundaries_invalids_and_conservation(self):
+        observer = GaussianCandidateDynamicBudgetObserverV1(
+            DynamicBudgetObserveConfigV1(
+                observe_histogram_bins=32,
+                k_max_reference=600,
+            )
+        )
+        quality = torch.tensor(
+            [0.0, 1.0, 0.5, float("nan"), -0.1, 1.1],
+            dtype=torch.float32,
+        )
+        result = observer.observe(
+            quality,
+            torch.ones(quality.shape[0], dtype=torch.bool),
+        )
+        self.assertEqual(result.q_valid_count, 3)
+        self.assertEqual(result.q_invalid_count, 3)
+        self.assertEqual(result.q_histogram_bins, 32)
+        self.assertEqual(len(result.q_histogram_counts), 32)
+        self.assertEqual(sum(result.q_histogram_counts), 3)
+        self.assertEqual(result.q_histogram_counts[0], 1)
+        self.assertEqual(result.q_histogram_counts[-1], 1)
+        self.assertTrue(
+            all(
+                isinstance(count, int) and count >= 0
+                for count in result.q_histogram_counts
+            )
+        )
+        counts_above_edges = tuple(
+            sum(result.q_histogram_counts[index:])
+            for index in range(result.q_histogram_bins)
+        )
+        self.assertEqual(counts_above_edges[0], 3)
+        self.assertEqual(counts_above_edges[16], 2)
+        self.assertEqual(counts_above_edges[-1], 1)
+        self.assertEqual(result.q_histogram_range, (0.0, 1.0))
+        self.assertEqual(result.k_max_reference, 600)
+        self.assertFalse(result.diagnostic_gpu_to_cpu_sync_expected)
+        self.assertTrue(result.to_fields()["count_above_bin_edges_recoverable"])
+
+    def test_dynamic_observe_forwards_original_five_tensors_without_selection(self):
+        states = tuple(
+            (
+                value,
+                value.data_ptr(),
+                value._version,
+                tuple(value.shape),
+                value.dtype,
+                value.device,
+                value.detach().clone(),
+            )
+            for value in self.candidates
+        )
+        with mock.patch.object(
+            torch,
+            "index_select",
+            side_effect=AssertionError("dynamic observe must not index candidates"),
+        ):
+            selector, token = self._dynamic_observe()
+        self.assertEqual(token.fields["mode"], "dynamic_k_observe")
+        self.assertEqual(token.fields["strategy"], "evidence")
+        self.assertFalse(token.fields["selection_applied"])
+        self.assertFalse(token.fields["selected_indices_created"])
+        self.assertEqual(token.fields["q_histogram_bins"], 32)
+        self.assertEqual(sum(token.fields["q_histogram_counts"]), 4)
+        self.assertEqual(token.fields["q_valid_count"], 4)
+        self.assertEqual(token.fields["q_invalid_count"], 0)
+        self.assertFalse(_contains_tensor(token.fields))
+        for value, state in zip(self.candidates, states):
+            reference, pointer, version, shape, dtype, device, frozen = state
+            self.assertIs(value, reference)
+            self.assertEqual(value.data_ptr(), pointer)
+            self.assertEqual(value._version, version)
+            self.assertEqual(tuple(value.shape), shape)
+            self.assertEqual(value.dtype, dtype)
+            self.assertEqual(value.device, device)
+            torch.testing.assert_close(value, frozen, atol=0.0, rtol=0.0)
+        summary = selector.record_after_extend(
+            token,
+            admitted_candidate_count=4,
+            dropped_candidate_count=0,
+            gaussian_after_extend=15,
+        )
+        self.assertTrue(summary.fields["all_candidates_forwarded"])
+        self.assertTrue(summary.fields["conservation_check"])
+
+    def test_dynamic_observe_init_empty_and_evidence_unavailable_have_no_q(self):
+        getter = SnapshotGetter(self.confidence)
+        _, init_token = self._dynamic_observe(init=True, getter=getter)
+        self.assertEqual(init_token.fields["reason"], "init_bypass")
+        self.assertEqual(len(init_token.fields["q_histogram_counts"]), 32)
+        self.assertEqual(sum(init_token.fields["q_histogram_counts"]), 0)
+        self.assertFalse(
+            init_token.fields["diagnostic_gpu_to_cpu_sync_expected"]
+        )
+        self.assertTrue(
+            init_token.fields["count_above_bin_edges_recoverable"]
+        )
+        self.assertEqual(getter.calls, 0)
+
+        empty = tuple(value[:0] for value in self.candidates)
+        _, empty_token = self._dynamic_observe(candidates=empty, getter=getter)
+        self.assertEqual(empty_token.fields["reason"], "empty_candidate")
+        self.assertEqual(empty_token.fields["candidate_count"], 0)
+        self.assertEqual(len(empty_token.fields["q_histogram_counts"]), 32)
+        self.assertEqual(sum(empty_token.fields["q_histogram_counts"]), 0)
+        self.assertFalse(
+            empty_token.fields["diagnostic_gpu_to_cpu_sync_expected"]
+        )
+        self.assertEqual(getter.calls, 0)
+
+        unavailable = self._evidence(available=False, reason="empty_old_map")
+        _, unavailable_token = self._dynamic_observe(
+            evidence=unavailable,
+            getter=getter,
+        )
+        self.assertEqual(unavailable_token.fields["reason"], "dynamic_q_unavailable")
+        self.assertEqual(unavailable_token.fields["fallback_reason"], "empty_old_map")
+        self.assertEqual(unavailable_token.fields["q_valid_count"], 0)
+        self.assertEqual(unavailable_token.fields["q_invalid_count"], 4)
+        self.assertEqual(
+            len(unavailable_token.fields["q_histogram_counts"]), 32
+        )
+        self.assertEqual(sum(unavailable_token.fields["q_histogram_counts"]), 0)
+        self.assertFalse(
+            unavailable_token.fields["diagnostic_gpu_to_cpu_sync_expected"]
+        )
+        self.assertEqual(getter.calls, 0)
+        for token in (init_token, empty_token, unavailable_token):
+            self.assertFalse(_contains_tensor(token.fields))
+
+    def test_dynamic_observe_logging_failure_does_not_interrupt_forwarding(self):
+        selector = self._dynamic_selector()
+        selector.logging_enabled = True
+        _, token = self._dynamic_observe()
+        with mock.patch("builtins.print", side_effect=OSError("closed log")):
+            summary = selector.record_after_extend(
+                token,
+                admitted_candidate_count=4,
+                dropped_candidate_count=0,
+                gaussian_after_extend=15,
+            )
+        self.assertTrue(summary.fields["conservation_check"])
 
     def test_init_bypass_preserves_candidates_without_confidence(self):
         references = list(self.candidates)
@@ -1383,6 +1629,44 @@ class GaussianCandidateSelectorV2Tests(unittest.TestCase):
         self.assertEqual(event["selected_count"], 2)
         self.assertNotIn("candidate_values", event)
         self.assertNotIn("quantiles", event)
+
+    def test_dynamic_observe_source_has_no_selection_render_or_quantile(self):
+        source = inspect.getsource(
+            GaussianCandidateDynamicKObserveV2.observe_before_extend
+        )
+        for forbidden in (
+            "index_select",
+            "selected_indices",
+            "torch.quantile",
+            "cuda.synchronize",
+            "gaussian_renderer",
+            ".tolist(",
+            ".numpy(",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, source)
+
+    def test_gaussian_model_dynamic_observe_hook_forwards_all_once(self):
+        extend_from_pcd_seq = load_gaussian_model_extend_from_pcd_seq()
+        harness = GaussianModelHookHarness(self.candidates)
+        selector = self._dynamic_selector()
+        with mock.patch.object(
+            PreinsertRenderEvidenceObserverV1,
+            "capture",
+            side_effect=AssertionError("dynamic observe must not render"),
+        ):
+            extend_from_pcd_seq(
+                harness,
+                self.camera,
+                self.camera.uid,
+                init=False,
+                candidate_selector_v2=selector,
+                mapper_update_id=23,
+                preinsert_render_evidence=self._evidence(),
+            )
+        self.assertEqual(harness.extend_calls, 1)
+        self.assertEqual(harness.last_extended_count, 4)
+        self.assertEqual(len(harness), 15)
 
     def test_gaussian_model_active_hook_filters_once_before_extend(self):
         extend_from_pcd_seq = load_gaussian_model_extend_from_pcd_seq()
