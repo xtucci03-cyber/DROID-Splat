@@ -1818,6 +1818,10 @@ class GaussianCandidateDynamicKObserveV2(GaussianCandidateSelectorV2):
 
     mode = DYNAMIC_K_OBSERVE_MODE
     is_active = False
+    # The borrowed confidence helper dispatches this static dependency via self.
+    _active_source_depth = staticmethod(
+        GaussianCandidateActiveFixedKV2._active_source_depth
+    )
 
     def __init__(
         self,
